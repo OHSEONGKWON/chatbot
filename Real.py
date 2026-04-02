@@ -5,7 +5,6 @@ from google import genai
 from google.genai import types
 from dotenv import load_dotenv
 
-# 1. 환경 변수 로드 (.env 파일의 GEMINI_API_KEY 사용)
 load_dotenv()
 app = FastAPI()
 
@@ -13,7 +12,6 @@ app = FastAPI()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-# 사용할 모델 설정 (확인하신 2.5-flash 모델)
 MODEL_ID = "gemini-2.5-flash"
 
 async def get_gemini_answer(question):
@@ -25,14 +23,15 @@ async def get_gemini_answer(question):
         response = client.models.generate_content(
             model=MODEL_ID,
             contents=(
-                f"당신은 성범죄 법률 전문 AI입니다. 아래 질문에 대해 "
-                f"관련 법조항이나 판례 근거를 바탕으로 전문적으로 답변하세요.\n"
-                f"단, 카카오톡 가독성을 위해 핵심 위주로 공백 포함 400자 이내로 "
-                f"명확하게 작성하고, 마침표로 깔끔하게 끝맺음하세요.\n\n"
+                f"당신은 성범죄 법률 전문 AI입니다. 질문에 대해 전문적으로 답변하되 아래 규칙을 엄수하세요.\n"
+                f"1. 답변은 반드시 3~4문장 내외로 짧고 명확하게 작성할 것.\n"
+                f"2. 가독성을 위해 각 문장마다 줄바꿈을 할 것.\n"
+                f"3. 법적 근거(형법 제00조 등)를 반드시 포함하되, 마지막은 '전문 변호사와 상담하세요'로 맺을 것.\n"
+                f"4. 공백 포함 300자 이내로 핵심만 전달할 것.\n\n"
                 f"질문: {question}"
             ),
             config=types.GenerateContentConfig(
-                max_output_tokens=600, 
+                max_output_tokens=1000, 
                 temperature=0.3,  # 법률 답변의 정확성을 위해 낮은 온도 설정
                 top_p=0.8
             )

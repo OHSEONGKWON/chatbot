@@ -1,27 +1,35 @@
 import os
-from dotenv import load_dotenv
+import ssl
+import certifi
 from google import genai
+from dotenv import load_dotenv
 
-# 1. .env 파일의 환경 변수를 로드합니다.
+# 1. SSL 인증서 검증 강제 우회 (핵심!)
+os.environ['SSL_CERT_FILE'] = certifi.where()
+ssl._create_default_https_context = ssl._create_unverified_context
+
 load_dotenv()
 
-# 2. .env 파일에 설정된 변수명(예: GEMINI_API_KEY)을 가져옵니다.
-# 만약 .env에 API_KEY라고 적으셨다면 os.getenv('API_KEY')로 수정하세요.
-api_key = os.getenv('GEMINI_API_KEY')
+# .env에서 API 키 가져오기
+api_key = os.getenv("GEMINI_API_KEY")
 
-if not api_key:
-    print("오류: .env 파일에서 API 키를 찾을 수 없습니다. 변수명을 확인해주세요.")
-else:
-    # 3. 클라이언트 생성
+try:
+    print("🚀 구글 서버에서 사용 가능한 모델 목록을 가져오는 중...")
+    # 여기서 genai.Client를 사용합니다.
     client = genai.Client(api_key=api_key)
+    
+    # 모델 리스트 가져오기
+    models = client.models.list()
+    
+    print("\n✅ [사용 가능한 모델 목록]")
+    print("-" * 40)
+    for model in models:
+        # 모델의 이름(ID)과 표시 이름을 출력합니다.
+        print(f"모델 ID: {model.name}")
+        print(f"표시 이름: {model.display_name}")
+        print("-" * 20)
+    print("-" * 40)
+    print("위 목록에서 'gemini-1.5-flash' 같은 ID를 복사해서 사용하세요.")
 
-    print(f"--- '{api_key[:5]}***' 키로 접근 가능한 모델 목록 ---")
-
-    try:
-        # 4. 모델 리스트 출력
-        for model in client.models.list():
-            # 실제 텍스트 생성 기능을 지원하는 모델만 필터링
-            if 'generateContent' in model.supported_actions:
-                print(f"모델명: {model.name}")
-    except Exception as e:
-        print(f"오류 발생: {e}")
+except Exception as e:
+    print(f"\n❌ 에러 발생: {e}")
