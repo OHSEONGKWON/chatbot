@@ -9,7 +9,6 @@ from dotenv import load_dotenv
 load_dotenv()
 app = FastAPI()
 
-# Gemini 설정 (가장 안정적인 방식)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 genai.configure(api_key=GEMINI_API_KEY)
 MODEL_ID = "models/gemini-2.5-flash" 
