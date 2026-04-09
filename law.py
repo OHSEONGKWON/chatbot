@@ -6,7 +6,7 @@ import os
 # ==========================================
 # 설정(Configuration)
 # ==========================================
-API_KEY = 'test'  # 본인의 인증키(OC)로 변경하세요 (test는 임시 키)
+API_KEY = 'tkatjdrnt123'  # 본인의 인증키(OC)로 변경하세요 (test는 임시 키)
 SEARCH_QUERY = '근로기준법'  # 수집할 검색어
 MAX_PAGES = 3      # 수집할 최대 페이지 수 (페이지당 20개)
 OUTPUT_FILE = 'supreme_court_precedents.jsonl' # 저장될 파일명
