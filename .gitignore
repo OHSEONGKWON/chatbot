@@ -1,0 +1,7 @@
+# Environments
+.env
+venv/
+
+# Data (데이터 파일도 용량이 크거나 보안이 필요하면 제외)
+data/
+*.jsonl 
