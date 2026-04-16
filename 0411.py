@@ -1,8 +1,11 @@
 """
 pip install google-genai fastapi uvicorn httpx python-dotenv
+pip install chromadb sentence-transformers openai bert-score requests
 """
 
 import os
+import sys
+import asyncio
 import base64
 import uvicorn
 import httpx
@@ -13,7 +16,21 @@ from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 
+# ── 환경변수 로드 (chatbot .env → Legal_chatbot .env 순서로) ────
 load_dotenv()
+
+_LEGAL_BASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Legal_chatbot")
+load_dotenv(dotenv_path=os.path.join(_LEGAL_BASE, ".env"))  # OPENAI_API_KEY 포함
+
+# ── RAG 모듈 import ──────────────────────────────────────────────
+sys.path.insert(0, os.path.join(_LEGAL_BASE, "model"))
+try:
+    from model_rag_v3_2 import run_full_pipeline
+    RAG_AVAILABLE = True
+    print("✅ RAG 모듈 로드 성공")
+except Exception as _e:
+    RAG_AVAILABLE = False
+    print(f"⚠️  RAG 모듈 로드 실패 (Gemini 폴백 사용): {_e}")
 
 # ── HTTP 세션 ─────────────────────────────────────────────────
 http_client = httpx.AsyncClient()
@@ -168,6 +185,24 @@ async def generate_legal_comic(user_utterance: str) -> str | None:
         return None
 
 
+async def _get_legal_answer(utterance: str) -> str:
+    """RAG 파이프라인으로 법률 답변 생성. 실패 시 Gemini 폴백."""
+    if RAG_AVAILABLE:
+        try:
+            result = await asyncio.to_thread(run_full_pipeline, utterance, None, False)
+            if result and result.final_answer:
+                return result.final_answer
+        except Exception as e:
+            print(f"⚠️  RAG 실패 → Gemini 폴백: {e}")
+
+    # Gemini 폴백
+    response = await client.aio.models.generate_content(
+        model=TEXT_MODEL,
+        contents=utterance
+    )
+    return response.text.strip()
+
+
 async def process_and_callback(callback_url: str, utterance: str):
     """백그라운드 처리 후 카카오톡 콜백 전송"""
     print(f"📩 콜백 시작 | utterance: {utterance[:30]}")
@@ -201,15 +236,12 @@ async def process_and_callback(callback_url: str, utterance: str):
                 }
 
         else:
-            response = await client.aio.models.generate_content(
-                model=TEXT_MODEL,
-                contents=utterance
-            )
+            answer = await _get_legal_answer(utterance)
             payload = {
                 "version": "2.0",
                 "template": {
                     "outputs": [
-                        {"simpleText": {"text": response.text.strip()[:500]}}
+                        {"simpleText": {"text": answer[:500]}}
                     ]
                 }
             }
@@ -236,16 +268,20 @@ async def kakao_chat(request: Request, background_tasks: BackgroundTasks):
 
     if callback_url:
         background_tasks.add_task(process_and_callback, callback_url, utterance)
+
+        is_comic = any(kw in utterance for kw in ["그림", "만화", "그려줘", "시각화"])
+        wait_msg = (
+            "AI가 상황을 분석하고 만화를 그리는 중입니다. 약 15초 정도 소요되니 잠시만 기다려주세요! 🎨"
+            if is_comic else
+            "⚖️ 법률 질문을 분석하고 있어요. 잠시만 기다려 주세요 😊"
+        )
+
         return {
             "version": "2.0",
             "useCallback": True,
             "template": {
                 "outputs": [
-                    {
-                        "simpleText": {
-                            "text": "🎨 법률 상황을 분석하고 네컷만화로 그려드릴게요!\n조금 더 정확한 그림을 위해 30초 정도 소요됩니다 😊"
-                        }
-                    }
+                    {"simpleText": {"text": wait_msg}}
                 ]
             }
         }
