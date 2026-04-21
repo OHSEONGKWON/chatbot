@@ -1,0 +1,6 @@
+data/**/*.jsonl filter=lfs diff=lfs merge=lfs -text
+outputs/**/*.safetensors filter=lfs diff=lfs merge=lfs -text
+outputs/**/*.pt filter=lfs diff=lfs merge=lfs -text
+outputs/**/*.pth filter=lfs diff=lfs merge=lfs -text
+outputs/**/*.bin filter=lfs diff=lfs merge=lfs -text
+data/RAG_data/chroma_db/** filter=lfs diff=lfs merge=lfs -text

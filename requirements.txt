@@ -35,3 +35,5 @@ transformers==5.5.4
 typer==0.24.1
 typing_extensions==4.15.0
 typing-inspection==0.4.2
+torch
+accelerate
