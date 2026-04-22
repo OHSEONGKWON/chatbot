@@ -70,6 +70,15 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-samples", type=int, default=0)
     parser.add_argument("--drop-no-entity", action="store_true")
+    parser.add_argument("--eval-strategy", choices=["no", "epoch"], default="epoch")
+    parser.add_argument("--save-strategy", choices=["no", "epoch"], default="epoch")
+    parser.add_argument("--dataloader-num-workers", type=int, default=max(1, min(8, (os.cpu_count() or 4) // 2)))
+    parser.add_argument("--torch-num-threads", type=int, default=0)
+    parser.add_argument(
+        "--group-by-length",
+        action="store_true",
+        help="Deprecated in current transformers version; kept for backward compatibility.",
+    )
     return parser.parse_args()
 
 
@@ -229,6 +238,12 @@ def main():
     args = parse_args()
     set_seed(args.seed)
 
+    if args.torch_num_threads > 0:
+        torch.set_num_threads(args.torch_num_threads)
+        print(f"[Perf] torch_num_threads={args.torch_num_threads}")
+    if args.group_by_length:
+        print("[Perf] --group-by-length is ignored on this transformers version.")
+
     files = find_files(args.data_dirs)
     print("[Data] Files:")
     for f in files:
@@ -258,25 +273,30 @@ def main():
         label2id=LABEL_TO_ID,
     )
 
-    training_args = TrainingArguments(
-        output_dir=args.output_dir,
-        eval_strategy="epoch",
-        save_strategy="epoch",
-        logging_steps=50,
-        learning_rate=args.learning_rate,
-        per_device_train_batch_size=args.train_batch_size,
-        per_device_eval_batch_size=args.eval_batch_size,
-        num_train_epochs=args.epochs,
-        weight_decay=0.01,
-        warmup_ratio=0.1,
-        load_best_model_at_end=True,
-        metric_for_best_model="token_f1",
-        greater_is_better=True,
-        report_to="none",
-        save_total_limit=2,
-        fp16=torch.cuda.is_available(),
-        seed=args.seed,
-    )
+    use_best_model = args.eval_strategy != "no" and args.save_strategy != "no"
+    training_kwargs = {
+        "output_dir": args.output_dir,
+        "eval_strategy": args.eval_strategy,
+        "save_strategy": args.save_strategy,
+        "logging_steps": 50,
+        "learning_rate": args.learning_rate,
+        "per_device_train_batch_size": args.train_batch_size,
+        "per_device_eval_batch_size": args.eval_batch_size,
+        "num_train_epochs": args.epochs,
+        "weight_decay": 0.01,
+        "warmup_ratio": 0.1,
+        "load_best_model_at_end": use_best_model,
+        "report_to": "none",
+        "save_total_limit": 2,
+        "fp16": torch.cuda.is_available(),
+        "seed": args.seed,
+        "dataloader_num_workers": args.dataloader_num_workers,
+    }
+    if use_best_model:
+        training_kwargs["metric_for_best_model"] = "token_f1"
+        training_kwargs["greater_is_better"] = True
+
+    training_args = TrainingArguments(**training_kwargs)
 
     trainer = Trainer(
         model=model,
