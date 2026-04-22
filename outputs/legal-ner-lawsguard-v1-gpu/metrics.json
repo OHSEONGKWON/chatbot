@@ -1,0 +1,24 @@
+{
+  "val": {
+    "eval_loss": 0.16182029247283936,
+    "eval_token_accuracy": 0.9414612031386225,
+    "eval_token_precision": 0.7868419570177169,
+    "eval_token_recall": 0.7968920489798247,
+    "eval_token_f1": 0.7918351149582084,
+    "eval_runtime": 47.9603,
+    "eval_samples_per_second": 119.557,
+    "eval_steps_per_second": 29.9,
+    "epoch": 2.0
+  },
+  "test": {
+    "eval_loss": 0.16571156680583954,
+    "eval_token_accuracy": 0.9411797563403574,
+    "eval_token_precision": 0.7955057441418175,
+    "eval_token_recall": 0.7916611376890037,
+    "eval_token_f1": 0.7935787845056322,
+    "eval_runtime": 48.3131,
+    "eval_samples_per_second": 118.705,
+    "eval_steps_per_second": 29.681,
+    "epoch": 2.0
+  }
+}
