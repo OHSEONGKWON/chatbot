@@ -52,7 +52,12 @@ class LegalNERDataset(Dataset):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Legal NER fine-tuning")
-    parser.add_argument("--data-dir", default="data/hallucination_data")
+    parser.add_argument(
+        "--data-dirs",
+        nargs="+",
+        default=["data/hallucination_data", "data/real_bio_data"],
+        help="One or more directories containing *_bio.jsonl files",
+    )
     parser.add_argument("--model-name", default="klue/roberta-base")
     parser.add_argument("--output-dir", default="outputs/legal-ner-klue")
     parser.add_argument("--max-length", type=int, default=512)
@@ -75,13 +80,17 @@ def set_seed(seed: int):
     torch.cuda.manual_seed_all(seed)
 
 
-def find_files(data_dir: str) -> List[str]:
+def find_files(data_dirs: List[str]) -> List[str]:
     files = []
-    for name in sorted(os.listdir(data_dir)):
-        if name.endswith("_hallu_bio.jsonl"):
-            files.append(os.path.join(data_dir, name))
+    for data_dir in data_dirs:
+        if not os.path.exists(data_dir):
+            continue
+        for root, _, filenames in os.walk(data_dir):
+            for name in sorted(filenames):
+                if name.endswith("_bio.jsonl"):
+                    files.append(os.path.join(root, name))
     if not files:
-        raise FileNotFoundError(f"No *_hallu_bio.jsonl files in {data_dir}")
+        raise FileNotFoundError(f"No *_bio.jsonl files in: {data_dirs}")
     return files
 
 
@@ -220,7 +229,7 @@ def main():
     args = parse_args()
     set_seed(args.seed)
 
-    files = find_files(args.data_dir)
+    files = find_files(args.data_dirs)
     print("[Data] Files:")
     for f in files:
         print(" -", f)
