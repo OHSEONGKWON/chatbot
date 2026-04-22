@@ -17,11 +17,13 @@ class LawsGuardPipeline:
             
         # 3. 교정 (Correction)
         corrected_answer = self.corrector.fix_answer(llm_answer, hallucinations)
+        is_modified = corrected_answer != llm_answer
+        status = "CORRECTED" if is_modified else "DETECTED"
         
         return {
-            "status": "CORRECTED",
+            "status": status,
             "final_answer": corrected_answer,
-            "is_modified": True,
+            "is_modified": is_modified,
             "logs": hallucinations
         }
 
