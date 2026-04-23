@@ -250,6 +250,7 @@ def main():
         print(" -", f)
 
     samples = load_samples(files, args.drop_no_entity)
+    random.Random(args.seed).shuffle(samples)
     if args.max_samples > 0:
         samples = samples[:args.max_samples]
 
