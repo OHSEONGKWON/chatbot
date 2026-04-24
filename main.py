@@ -1,57 +1,114 @@
-from modules.ner_checker import NERFactChecker
-from modules.corrector import AnswerCorrector
+"""LawsGuard FastAPI 메인 애플리케이션"""
 
-class LawsGuardPipeline:
-    def __init__(self):
-        self.checker = NERFactChecker()
-        self.corrector = AnswerCorrector()
-        print("[System] 파이프라인 준비 완료.\n")
+import asyncio
+import logging
+import time
+from contextlib import asynccontextmanager
 
-    def run(self, llm_answer, rag_chunks):
-        # 1. 탐지 (Detection)
-        hallucinations = self.checker.find_hallucinations(llm_answer, rag_chunks)
-        
-        # 2. 통과 (Pass)
-        if not hallucinations:
-            return {"status": "PASS", "final_answer": llm_answer, "is_modified": False, "logs": []}
-            
-        # 3. 교정 (Correction)
-        corrected_answer = self.corrector.fix_answer(llm_answer, hallucinations)
-        is_modified = corrected_answer != llm_answer
-        status = "CORRECTED" if is_modified else "DETECTED"
-        
-        return {
-            "status": status,
-            "final_answer": corrected_answer,
-            "is_modified": is_modified,
-            "logs": hallucinations
-        }
+import httpx
+from fastapi import BackgroundTasks, FastAPI, Request
+from fastapi.responses import JSONResponse
 
-# ==========================================
-# 🧪 규격 테스트용 실행부
-# ==========================================
+from config import config
+from pipeline import LawsGuardPipeline, pipeline
+from session_store import session_store
+
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logger = logging.getLogger("lawsguard")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    cleanup_task = asyncio.create_task(_session_cleanup_loop())
+    logger.info("LawsGuard 서버 시작")
+    yield
+    cleanup_task.cancel()
+    logger.info("LawsGuard 서버 종료")
+
+
+async def _session_cleanup_loop():
+    while True:
+        await asyncio.sleep(1800)
+        session_store.cleanup_expired()
+        logger.info("만료 세션 정리 완료")
+
+
+app = FastAPI(title="LawsGuard API", description="RAG 기반 한국 법률 상담 챗봇 스킬 서버", version="1.0.0", lifespan=lifespan)
+
+
+def build_simple_text(text: str) -> dict:
+    return {"version": "2.0", "template": {"outputs": [{"simpleText": {"text": text}}]}}
+
+
+def build_callback_response(waiting_message: str) -> dict:
+    return {"version": "2.0", "useCallback": True, "data": {"text": waiting_message}}
+
+
+async def send_callback(callback_url: str, response_text: str):
+    payload = build_simple_text(response_text)
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            resp = await client.post(callback_url, json=payload)
+            logger.info(f"콜백 전송 완료: {resp.status_code} → {callback_url[:50]}")
+        except Exception as e:
+            logger.error(f"콜백 전송 실패: {e}")
+
+
+async def run_pipeline_and_callback(user_id: str, user_input: str, callback_url: str):
+    start = time.monotonic()
+    try:
+        result = await pipeline.process(user_id=user_id, user_input=user_input)
+        elapsed = time.monotonic() - start
+        logger.info(
+            f"파이프라인 완료 | user={user_id[:8]}... | step={result.step_reached} | "
+            f"score={(f'{result.consistency_score:.3f}' if result.consistency_score is not None else 'N/A')} | time={elapsed:.2f}s"
+        )
+        await send_callback(callback_url, result.response_text)
+    except Exception as e:
+        logger.exception(f"파이프라인 오류: {e}")
+        await send_callback(callback_url, "죄송합니다. 처리 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.")
+
+
+@app.post("/webhook/kakao")
+async def kakao_webhook(request: Request, background_tasks: BackgroundTasks):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(content=build_simple_text("요청 형식이 올바르지 않습니다."), status_code=400)
+
+    user_request = body.get("userRequest", {})
+    user_id = user_request.get("user", {}).get("id", "anonymous")
+    user_input = user_request.get("utterance", "").strip()
+    callback_url = user_request.get("callbackUrl", "")
+
+    if not user_input:
+        return JSONResponse(content=build_simple_text("질문을 입력해 주세요."))
+
+    logger.info(f"수신 | user={user_id[:8]}... | input={user_input[:30]}...")
+
+    if config.kakao.use_callback and callback_url:
+        background_tasks.add_task(run_pipeline_and_callback, user_id=user_id, user_input=user_input, callback_url=callback_url)
+        return JSONResponse(content=build_callback_response(config.kakao.callback_message))
+
+    try:
+        result = await asyncio.wait_for(pipeline.process(user_id=user_id, user_input=user_input), timeout=config.kakao.response_timeout_sec)
+        logger.info("동기 응답 완료")
+        return JSONResponse(content=build_simple_text(result.response_text))
+    except asyncio.TimeoutError:
+        logger.warning("응답 시간 초과 - 콜백 모드로 전환 필요")
+        return JSONResponse(content=build_simple_text("처리 시간이 초과되었습니다. 잠시 후 다시 시도해 주세요."))
+    except Exception as e:
+        logger.exception(f"처리 오류: {e}")
+        return JSONResponse(content=build_simple_text("오류가 발생했습니다. 잠시 후 다시 시도해 주세요."))
+
+
+@app.get("/health")
+async def health_check():
+    return {"status": "ok", "service": "LawsGuard"}
+
+
 if __name__ == "__main__":
-    pipeline = LawsGuardPipeline()
-    
-    # [시뮬레이션] 나중에 팀원이 넘겨줄 RAG 데이터 규격 (껍데기만 진짜, 내용은 임의 작성)
-    mock_rag_chunks = [
-        {
-            "chunk_id": "f4b057319cc181f1_제5조_0", 
-            "text": "제5조(부당해고등의 구제신청) 근로자는 부당해고등의 구제 신청서를 관할 중앙노동위원회에 30일 이내에 제출하여야 한다.", 
-            "metadata": {"law_name": "근로기준법 시행규칙"}
-        }
-    ]
-    
-    # [시뮬레이션] 팀원이 1차 검사 후 넘겨준 답변 (일부러 날짜를 '60일'로 환각 처리함)
-    mock_llm_answer = "근로기준법 시행규칙 제5조에 따라, 부당해고 구제 신청서는 60일 이내에 제출해야 합니다."
-    
-    print(f"🔹 1차 답변 (환각 포함): {mock_llm_answer}")
-    
-    # 파이프라인 가동!
-    result = pipeline.run(mock_llm_answer, mock_rag_chunks)
-    
-    print("\n--- [카카오톡 최종 출력 결과] ---")
-    print(f"✅ 최종 답변: {result['final_answer']}")
-    print(f"🔄 수정 여부: {result['is_modified']}")
-    if result['is_modified']:
-        print(f"📋 수정 로그: {result['logs']}")
+    import uvicorn
+
+    uvicorn.run("main:app", host=config.kakao.server_host, port=config.kakao.server_port, reload=False, workers=1, log_level="info")
