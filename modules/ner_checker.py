@@ -1,9 +1,21 @@
 import os
 import json
 import re
+from dataclasses import dataclass
 
 import torch
 from transformers import pipeline
+
+from modules.corrector import AnswerCorrector
+
+
+@dataclass
+class NERCheckResult:
+    original_answer: str
+    corrected_answer: str
+    found_entities: list
+    mismatched_entities: list[dict]
+    was_corrected: bool
 
 class NERFactChecker:
     def __init__(self, model_path=None):
@@ -24,6 +36,7 @@ class NERFactChecker:
             "labor": ["근로", "해고", "임금", "노동", "최저임금", "취업규칙", "근로기준"],
             "finance": ["사기", "대출", "채권", "금융", "이자", "변제", "채무"],
         }
+        self._corrector = AnswerCorrector()
 
     def _resolve_model_path(self, model_path):
         env_model_path = os.getenv("LAWSGUARD_NER_MODEL")
@@ -315,3 +328,18 @@ class NERFactChecker:
             return date_words[0]
 
         return same_label_words[0]
+
+    async def check_and_correct(self, answer, rag_docs):
+        hallucinations = self.find_hallucinations(answer, rag_docs)
+        corrected_answer = self._corrector.fix_answer(answer, hallucinations)
+        return NERCheckResult(
+            original_answer=answer,
+            corrected_answer=corrected_answer,
+            found_entities=self.extract_entities(answer),
+            mismatched_entities=hallucinations,
+            was_corrected=corrected_answer != answer,
+        )
+
+
+# Team_code pipeline 호환용 전역 인스턴스
+ner_checker = NERFactChecker()
