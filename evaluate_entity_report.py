@@ -178,7 +178,7 @@ def parse_args():
     parser.add_argument("--model-path", default=None, help="Optional model path. If omitted, checker auto-resolves.")
     parser.add_argument("--max-samples", type=int, default=0)
     parser.add_argument("--file-workers", type=int, default=4)
-    parser.add_argument("--output-json", default="outputs/legal-ner-lawsguard-v1-gpu/entity_report.json")
+    parser.add_argument("--output-json", default="outputs/legal-ner-lawsguard-v2-30k/entity_report.json")
     return parser.parse_args()
 
 
