@@ -41,6 +41,7 @@ class NERFactChecker:
     def _resolve_model_path(self, model_path):
         env_model_path = os.getenv("LAWSGUARD_NER_MODEL")
         local_candidates = [
+            "outputs/legal-ner-lawsguard-v2-30k",
             "outputs/legal-ner-lawsguard-v1-gpu",
             "outputs/legal-ner-lawsguard-v1-fastfull",
             "outputs/legal-ner-lawsguard-v1",
