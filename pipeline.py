@@ -35,6 +35,22 @@ class LawsGuardPipeline:
         self._retriever = retriever
         self._cfg = config
 
+    def _build_consistency_requery(self, question: str, legal_category: str, avg_score: float) -> str:
+        # Generic requery builder used as a fallback only.
+        if legal_category == "불명확":
+            return (
+                "어떤 상황인지 조금만 더 자세히 알려주세요.\n"
+                "언제, 어디서, 누가, 어떤 일이 있었는지 알려주시면 더 정확히 도와드릴 수 있어요."
+            )
+
+        if avg_score is not None and avg_score < self._cfg.hallucination.consistency_threshold:
+            return (
+                "조금 더 구체적으로 알려주실 수 있나요?\n"
+                "필요한 정보(예: 언제/어디서/누구 등)를 한두 문장으로 알려주시면 재검토하겠습니다."
+            )
+
+        return "조금 더 구체적으로 알려주실 수 있나요?"
+
     async def process(self, user_id: str, user_input: str) -> PipelineResult:
         session = session_store.get(user_id)
         if session is None:
@@ -61,11 +77,28 @@ class LawsGuardPipeline:
 
         is_reliable, original_answer, avg_score, _ = await self._consistency.run(final_question)
         if not is_reliable:
-            session_store.delete(user_id)
+            session.retry_count += 1
+            # Use dynamic requery generation (avoid fixed sexual-case templates)
+            try:
+                eval_obj = clarify_result.eval
+                missing = eval_obj.missing_elements if eval_obj else []
+                entity_check = eval_obj.entity_check if eval_obj else None
+                requery_message = await self._clarify.generate_requery(
+                    question=final_question,
+                    missing=missing,
+                    retry_count=session.retry_count,
+                    entity_check=entity_check,
+                    context=session.accumulated_context,
+                    session=session,
+                )
+            except Exception:
+                # fallback to previous heuristic builder
+                requery_message = self._build_consistency_requery(final_question, legal_category, avg_score)
+
             return PipelineResult(
-                response_text=self._cfg.hallucination.answer_give_up_message,
-                needs_requery=False,
-                session_ended=True,
+                response_text=requery_message,
+                needs_requery=True,
+                session_ended=False,
                 consistency_score=avg_score,
                 legal_category=legal_category,
                 step_reached=4,

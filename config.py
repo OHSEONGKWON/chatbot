@@ -9,7 +9,7 @@ from typing import Optional
 
 @dataclass
 class RAGConfig:
-	chroma_path: str = r"D:\Law_Chatbot\chroma_db"
+	chroma_path: str = r"c:\GitHub\chatbot\data\RAG_data\chroma_db"
 	collection_name: str = "legal_documents"
 	embedding_model: str = "intfloat/multilingual-e5-large"
 	top_k: int = 5

@@ -100,7 +100,17 @@ class ConsistencyChecker:
 		premise_trunc = premise[:400]
 		hyp_trunc = hypothesis[:400]
 		results = self._nli(f"{premise_trunc} [SEP] {hyp_trunc}")
-		label_map = {r["label"].lower(): r["score"] for r in results}
+		if results and isinstance(results[0], list):
+			results = results[0]
+
+		label_map = {}
+		for item in results:
+			if not isinstance(item, dict):
+				continue
+			label = item.get("label")
+			score = item.get("score")
+			if isinstance(label, str) and isinstance(score, (int, float)):
+				label_map[label.lower()] = float(score)
 		entail = label_map.get("entailment", label_map.get("함의", 0.0))
 		neutral = label_map.get("neutral", label_map.get("중립", 0.0))
 		return entail + 0.3 * neutral
