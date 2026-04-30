@@ -8,8 +8,13 @@ import os
 from typing import Optional
 
 from openai import AsyncOpenAI
+from dotenv import load_dotenv
 
 from config import config
+
+
+# Ensure local .env values (e.g., OPENAI_API_KEY) are visible to this process.
+load_dotenv()
 
 
 class LLMClient:
@@ -39,7 +44,24 @@ class LLMClient:
 			timeout=self.timeout,
 			**kwargs,
 		)
-		return resp.choices[0].message.content.strip()
+		message = resp.choices[0].message
+		content = message.content
+
+		# Some providers can return None or structured content parts.
+		if content is None:
+			return ""
+
+		if isinstance(content, str):
+			return content.strip()
+
+		parts: list[str] = []
+		for item in content:
+			if isinstance(item, dict):
+				text = item.get("text")
+				if isinstance(text, str):
+					parts.append(text)
+
+		return "\n".join(parts).strip()
 
 	async def batch_complete(self, prompts: list[tuple[str, str]], temperature: Optional[float] = None) -> list[str]:
 		tasks = [self.complete(sys_p, usr_p, temperature) for sys_p, usr_p in prompts]
