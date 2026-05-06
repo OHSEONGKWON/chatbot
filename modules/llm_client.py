@@ -29,6 +29,8 @@ class LLMClient:
 		self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
 
 	async def complete(self, system_prompt: str, user_prompt: str, temperature: Optional[float] = None, max_tokens: Optional[int] = None, json_mode: bool = False) -> str:
+		temp_value = self.temperature if temperature is None else temperature
+		token_limit = self.max_tokens if max_tokens is None else max_tokens
 		kwargs = {}
 		if json_mode:
 			kwargs["response_format"] = {"type": "json_object"}
@@ -39,8 +41,8 @@ class LLMClient:
 				{"role": "system", "content": system_prompt},
 				{"role": "user", "content": user_prompt},
 			],
-			temperature=temperature or self.temperature,
-			max_tokens=max_tokens or self.max_tokens,
+			temperature=temp_value,
+			max_tokens=token_limit,
 			timeout=self.timeout,
 			**kwargs,
 		)
