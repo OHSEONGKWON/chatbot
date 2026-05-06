@@ -9,9 +9,9 @@ import httpx
 from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from config import config
-from pipeline import LawsGuardPipeline, pipeline
-from session_store import session_store
+from .config import config
+from .pipeline import LawsGuardPipeline, pipeline
+from .session_store import session_store
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")

@@ -41,3 +41,4 @@ fastapi
 uvicorn
 chromadb
 sentence-transformers
+rapidfuzz

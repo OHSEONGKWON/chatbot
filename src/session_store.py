@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-from config import config
+from .config import config
 
 
 @dataclass

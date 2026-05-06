@@ -1,0 +1,3 @@
+--- archived placeholder ---
+Original file: modules_ner_checker.py
+Moved during cleanup on 2026-05-06. Use `src/modules/ner_checker.py` as the active implementation.

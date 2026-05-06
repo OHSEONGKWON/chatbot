@@ -6,13 +6,13 @@ import asyncio
 from dataclasses import dataclass
 from typing import Optional
 
-from modules.answer_formatter import answer_formatter
-from modules.clarification import ClarificationResult, clarification_manager
-from modules.consistency_checker import consistency_checker
-from modules.ner_checker import ner_checker
-from modules.rag import retriever
-from session_store import ClarificationSession, session_store
-from config import config
+from .modules.answer_formatter import answer_formatter
+from .modules.clarification import ClarificationResult, clarification_manager
+from .modules.consistency_checker import consistency_checker
+from .modules.ner_checker import ner_checker
+from .modules.rag import retriever
+from .session_store import ClarificationSession, session_store
+from .config import config
 
 
 @dataclass
