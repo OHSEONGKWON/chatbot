@@ -1,17 +1,15 @@
-"""
-LawsGuard 메인 파이프라인 오케스트레이터
-"""
+"""LawsGuard 메인 파이프라인 오케스트레이터."""
 
-import asyncio
 from dataclasses import dataclass
 from typing import Optional
 
 from .modules.answer_formatter import answer_formatter
 from .modules.clarification import ClarificationResult, clarification_manager
 from .modules.consistency_checker import consistency_checker
+from .modules.legal_reasoning_validator import legal_reasoning_validator
 from .modules.ner_checker import ner_checker
 from .modules.rag import retriever
-from .session_store import ClarificationSession, session_store
+from .session_store import session_store
 from .config import config
 
 
@@ -21,6 +19,7 @@ class PipelineResult:
     needs_requery: bool
     session_ended: bool
     consistency_score: Optional[float] = None
+    legal_reasoning_score: Optional[float] = None
     was_ner_corrected: bool = False
     legal_category: str = ""
     step_reached: int = 0
@@ -30,6 +29,7 @@ class LawsGuardPipeline:
     def __init__(self):
         self._clarify = clarification_manager
         self._consistency = consistency_checker
+        self._legal_reasoning = legal_reasoning_validator
         self._ner = ner_checker
         self._formatter = answer_formatter
         self._retriever = retriever
@@ -75,7 +75,12 @@ class LawsGuardPipeline:
         final_question = clarify_result.final_question
         legal_category = clarify_result.legal_category
 
-        is_reliable, original_answer, avg_score, _ = await self._consistency.run(final_question)
+        rag_docs = await self._retriever.retrieve_async(final_question, legal_category=legal_category)
+        is_reliable, original_answer, avg_score, _ = await self._consistency.run(
+            final_question,
+            rag_docs=rag_docs,
+            legal_category=legal_category,
+        )
         if not is_reliable:
             session.retry_count += 1
             # Use dynamic requery generation (avoid fixed sexual-case templates)
@@ -104,8 +109,14 @@ class LawsGuardPipeline:
                 step_reached=4,
             )
 
-        rag_docs = await self._retriever.retrieve_async(final_question)
-        ner_result = await self._ner.check_and_correct(answer=original_answer, rag_docs=rag_docs)
+        legal_reasoning_result = await self._legal_reasoning.validate(
+            question=final_question,
+            answer=original_answer,
+            rag_docs=rag_docs,
+            legal_category=legal_category,
+        )
+
+        ner_result = await self._ner.check_and_correct(answer=legal_reasoning_result.validated_answer, rag_docs=rag_docs)
         corrected_answer = ner_result.corrected_answer
 
         final_response = await self._formatter.format(
@@ -122,6 +133,7 @@ class LawsGuardPipeline:
             needs_requery=False,
             session_ended=True,
             consistency_score=avg_score,
+            legal_reasoning_score=legal_reasoning_result.score,
             was_ner_corrected=ner_result.was_corrected,
             legal_category=legal_category,
             step_reached=7,

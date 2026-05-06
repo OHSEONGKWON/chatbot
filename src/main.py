@@ -10,7 +10,8 @@ from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from .config import config
-from .pipeline import LawsGuardPipeline, pipeline
+from .modules.kakao_response import build_callback_response, build_simple_text, default_quick_replies
+from .pipeline import pipeline
 from .session_store import session_store
 
 
@@ -37,20 +38,15 @@ async def _session_cleanup_loop():
 app = FastAPI(title="LawsGuard API", description="RAG 기반 한국 법률 상담 챗봇 스킬 서버", version="1.0.0", lifespan=lifespan)
 
 
-def build_simple_text(text: str) -> dict:
-    return {"version": "2.0", "template": {"outputs": [{"simpleText": {"text": text}}]}}
-
-
-def build_callback_response(waiting_message: str) -> dict:
-    return {"version": "2.0", "useCallback": True, "data": {"text": waiting_message}}
-
-
-async def send_callback(callback_url: str, response_text: str):
-    payload = build_simple_text(response_text)
+async def send_callback(callback_url: str, response_text: str, needs_requery: bool = False, category: str = ""):
+    payload = build_simple_text(response_text, quick_replies=default_quick_replies(needs_requery, category))
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
             resp = await client.post(callback_url, json=payload)
-            logger.info(f"콜백 전송 완료: {resp.status_code} → {callback_url[:50]}")
+            if resp.status_code >= 400:
+                logger.error(f"콜백 전송 실패 응답: {resp.status_code} | {resp.text[:300]}")
+            else:
+                logger.info(f"콜백 전송 완료: {resp.status_code} → {callback_url[:50]}")
         except Exception as e:
             logger.error(f"콜백 전송 실패: {e}")
 
@@ -62,9 +58,11 @@ async def run_pipeline_and_callback(user_id: str, user_input: str, callback_url:
         elapsed = time.monotonic() - start
         logger.info(
             f"파이프라인 완료 | user={user_id[:8]}... | step={result.step_reached} | "
-            f"score={(f'{result.consistency_score:.3f}' if result.consistency_score is not None else 'N/A')} | time={elapsed:.2f}s"
+            f"score={(f'{result.consistency_score:.3f}' if result.consistency_score is not None else 'N/A')} | "
+            f"legal={(f'{result.legal_reasoning_score:.3f}' if result.legal_reasoning_score is not None else 'N/A')} | "
+            f"time={elapsed:.2f}s"
         )
-        await send_callback(callback_url, result.response_text)
+        await send_callback(callback_url, result.response_text, result.needs_requery, result.legal_category)
     except Exception as e:
         logger.exception(f"파이프라인 오류: {e}")
         await send_callback(callback_url, "죄송합니다. 처리 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.")
@@ -83,7 +81,7 @@ async def kakao_webhook(request: Request, background_tasks: BackgroundTasks):
     callback_url = user_request.get("callbackUrl", "")
 
     if not user_input:
-        return JSONResponse(content=build_simple_text("질문을 입력해 주세요."))
+        return JSONResponse(content=build_simple_text("질문을 입력해 주세요.", quick_replies=default_quick_replies(True)))
 
     logger.info(f"수신 | user={user_id[:8]}... | input={user_input[:30]}...")
 
@@ -94,7 +92,12 @@ async def kakao_webhook(request: Request, background_tasks: BackgroundTasks):
     try:
         result = await asyncio.wait_for(pipeline.process(user_id=user_id, user_input=user_input), timeout=config.kakao.response_timeout_sec)
         logger.info("동기 응답 완료")
-        return JSONResponse(content=build_simple_text(result.response_text))
+        return JSONResponse(
+            content=build_simple_text(
+                result.response_text,
+                quick_replies=default_quick_replies(result.needs_requery, result.legal_category),
+            )
+        )
     except asyncio.TimeoutError:
         logger.warning("응답 시간 초과 - 콜백 모드로 전환 필요")
         return JSONResponse(content=build_simple_text("처리 시간이 초과되었습니다. 잠시 후 다시 시도해 주세요."))
@@ -111,4 +114,4 @@ async def health_check():
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("main:app", host=config.kakao.server_host, port=config.kakao.server_port, reload=False, workers=1, log_level="info")
+    uvicorn.run("src.main:app", host=config.kakao.server_host, port=config.kakao.server_port, reload=False, workers=1, log_level="info")

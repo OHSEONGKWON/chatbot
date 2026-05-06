@@ -1,19 +1,38 @@
-"""
-LawsGuard 설정 파일
-모든 상수, 임계값, 모델 경로 등을 중앙 관리
-"""
+"""LawsGuard 설정 파일."""
 
+import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
+
+from dotenv import load_dotenv
+
+
+BASE_DIR = Path(__file__).resolve().parents[1]
+load_dotenv(BASE_DIR / ".env")
 
 
 @dataclass
 class RAGConfig:
-	chroma_path: str = r"c:\GitHub\chatbot\data\RAG_data\chroma_db"
+	chroma_path: str = str(BASE_DIR / "data" / "RAG_data" / "chroma_db")
 	collection_name: str = "legal_documents"
 	embedding_model: str = "intfloat/multilingual-e5-large"
+	enable_vector: bool = os.getenv("LAWSGUARD_ENABLE_VECTOR_RAG", "0") == "1"
 	top_k: int = 5
 	embedding_batch_size: int = 32
+	jsonl_paths: tuple[str, ...] = (
+		str(BASE_DIR / "data" / "real_data" / "New_Dataset" / "rag_law_chunks.jsonl"),
+		str(BASE_DIR / "data" / "real_data" / "New_Dataset" / "rag_case_chunks.jsonl"),
+		str(BASE_DIR / "data" / "real_data" / "New_Dataset" / "rag_manual_chunks.jsonl"),
+	)
+
+
+@dataclass
+class NERConfig:
+	model_path: str = os.getenv("LAWSGUARD_NER_MODEL", str(BASE_DIR / "outputs" / "legal-ner-lawsguard-v2-30k"))
+	use_model: bool = os.getenv("LAWSGUARD_USE_MODEL_NER", "1") == "1"
+	min_confidence: float = float(os.getenv("LAWSGUARD_NER_MIN_CONFIDENCE", "0.70"))
+	max_length: int = int(os.getenv("LAWSGUARD_NER_MAX_LENGTH", "510"))
 
 
 @dataclass
@@ -37,13 +56,13 @@ class HallucinationConfig:
 
 @dataclass
 class LLMConfig:
-	provider: str = "openai"
-	model_name: str = "gpt-4o"
-	api_base: Optional[str] = None
-	api_key: Optional[str] = None
-	temperature: float = 0.2
-	max_tokens: int = 2048
-	request_timeout: int = 60
+	provider: str = os.getenv("LAWSGUARD_LLM_PROVIDER", "openai")
+	model_name: str = os.getenv("LAWSGUARD_OPENAI_MODEL", "gpt-4o-mini")
+	api_base: Optional[str] = os.getenv("OPENAI_BASE_URL") or None
+	api_key: Optional[str] = os.getenv("OPENAI_API_KEY") or None
+	temperature: float = float(os.getenv("LAWSGUARD_LLM_TEMPERATURE", "0.2"))
+	max_tokens: int = int(os.getenv("LAWSGUARD_LLM_MAX_TOKENS", "2048"))
+	request_timeout: int = int(os.getenv("LAWSGUARD_LLM_TIMEOUT", "60"))
 
 
 @dataclass
@@ -58,6 +77,7 @@ class KakaoConfig:
 @dataclass
 class AppConfig:
 	rag: RAGConfig = field(default_factory=RAGConfig)
+	ner: NERConfig = field(default_factory=NERConfig)
 	clarification: ClarificationConfig = field(default_factory=ClarificationConfig)
 	hallucination: HallucinationConfig = field(default_factory=HallucinationConfig)
 	llm: LLMConfig = field(default_factory=LLMConfig)

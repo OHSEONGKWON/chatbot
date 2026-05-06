@@ -1,7 +1,11 @@
 import json
+import sys
 from pathlib import Path
 
-from modules.ner_checker import NERFactChecker
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+
+from src.modules.ner_checker import NERFactChecker
 
 
 def load_jsonl(path: Path):
@@ -72,8 +76,7 @@ def evaluate(checker: NERFactChecker, rows, fuzzy_threshold: float, semantic_thr
 
 
 def main():
-    root = Path(__file__).resolve().parents[1]
-    data_path = root / "data" / "mock_data" / "ner_hybrid_eval_pairs.jsonl"
+    data_path = REPO_ROOT / "data" / "mock_data" / "ner_hybrid_eval_pairs.jsonl"
     rows = load_jsonl(data_path)
 
     checker = NERFactChecker()

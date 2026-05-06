@@ -1,7 +1,13 @@
 #!/usr/bin/env python
 """긴 카카오 답변에서 환각 감지 테스트"""
 import os
-from modules.ner_checker import NERFactChecker
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from src.modules.ner_checker import NERFactChecker
 
 # 모델 설정
 os.environ['LAWSGUARD_NER_MODEL'] = 'outputs/legal-ner-lawsguard-v2-30k'

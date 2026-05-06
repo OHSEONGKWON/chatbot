@@ -42,3 +42,5 @@ uvicorn
 chromadb
 sentence-transformers
 rapidfuzz
+pytest
+pytest-asyncio

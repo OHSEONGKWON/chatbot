@@ -1,6 +1,9 @@
 import re
+import asyncio
+import os
 from dataclasses import dataclass
 from difflib import SequenceMatcher
+from pathlib import Path
 
 try:
     import torch
@@ -54,6 +57,10 @@ class NERFactChecker:
     """
     def __init__(self, model_path=None):
         self.target_labels = ['LAW', 'PENALTY', 'AMOUNT', 'DATE', 'ORG', 'CRIME']
+        self.model_path = model_path or getattr(getattr(config, "ner", None), "model_path", None)
+        self.use_model = bool(getattr(getattr(config, "ner", None), "use_model", True))
+        self.min_model_confidence = float(getattr(getattr(config, "ner", None), "min_confidence", 0.70))
+        self.max_length = int(getattr(getattr(config, "ner", None), "max_length", 510))
 
         # Domain keywords (simple examples)
         self.domain_keywords = {
@@ -91,13 +98,314 @@ class NERFactChecker:
         # Matching thresholds
         self.fuzzy_threshold = 0.90
         self.semantic_threshold = 0.82
-        self.enable_semantic_match = True
+        self.enable_semantic_match = os.getenv("LAWSGUARD_ENABLE_SEMANTIC_NER", "0") == "1"
         self.semantic_allowed_labels = {"CRIME", "PENALTY"}
 
         # Lazy components
         self._semantic_embedder = None
         self._corrector = AnswerCorrector()
-        self._ner_pipeline = None
+        self._ner_model = None
+        self._ner_tokenizer = None
+
+    async def check_and_correct(self, answer, rag_docs):
+        return await asyncio.to_thread(self.check_and_correct_sync, answer, rag_docs)
+
+    def check_and_correct_sync(self, answer, rag_docs):
+        found_entities = self.extract_entities(answer)
+        mismatches = self.find_hallucinations(answer, rag_docs, found_entities=found_entities)
+        corrected = self._corrector.fix_answer(answer, mismatches)
+        return NERCheckResult(
+            original_answer=answer,
+            corrected_answer=corrected,
+            found_entities=found_entities,
+            mismatched_entities=mismatches,
+            was_corrected=corrected != answer,
+        )
+
+    def extract_entities(self, text):
+        model_entities = self._extract_entities_with_model(text)
+        rule_entities = self._extract_entities_with_rules(text)
+        if model_entities:
+            return self._merge_entity_lists(model_entities, rule_entities)
+        return rule_entities
+
+    def _extract_entities_with_model(self, text):
+        model, tokenizer = self._load_ner_model()
+        if model is None or tokenizer is None or torch is None:
+            return []
+
+        entities = []
+        for offset, chunk in self._iter_text_chunks(text):
+            try:
+                encoded = tokenizer(
+                    chunk,
+                    return_offsets_mapping=True,
+                    truncation=True,
+                    max_length=self.max_length,
+                    return_tensors="pt",
+                )
+                offsets = encoded.pop("offset_mapping")[0].tolist()
+                device = next(model.parameters()).device
+                encoded = {key: value.to(device) for key, value in encoded.items()}
+                with torch.no_grad():
+                    logits = model(**encoded).logits[0]
+                probs = torch.softmax(logits, dim=-1)
+                pred_ids = torch.argmax(probs, dim=-1).tolist()
+                pred_scores = torch.max(probs, dim=-1).values.tolist()
+                entities.extend(self._bio_predictions_to_entities(chunk, offset, offsets, pred_ids, pred_scores, model.config.id2label))
+            except Exception:
+                continue
+        return self._dedupe_entities(entities)
+
+    def _load_ner_model(self):
+        if not self.use_model:
+            return None, None
+        if self._ner_model is not None and self._ner_tokenizer is not None:
+            return self._ner_model, self._ner_tokenizer
+        if not self.model_path or not Path(self.model_path).exists():
+            return None, None
+        try:
+            from transformers import AutoModelForTokenClassification, AutoTokenizer
+
+            tokenizer = AutoTokenizer.from_pretrained(self.model_path, local_files_only=True, use_fast=True)
+            model = AutoModelForTokenClassification.from_pretrained(self.model_path, local_files_only=True)
+            device = "cuda" if (torch is not None and torch.cuda.is_available()) else "cpu"
+            model.to(device)
+            model.eval()
+            self._ner_model = model
+            self._ner_tokenizer = tokenizer
+        except Exception:
+            self._ner_model = None
+            self._ner_tokenizer = None
+        return self._ner_model, self._ner_tokenizer
+
+    def _iter_text_chunks(self, text):
+        if len(text) <= 900:
+            yield 0, text
+            return
+        start = 0
+        while start < len(text):
+            end = min(len(text), start + 900)
+            if end < len(text):
+                cut = max(text.rfind("\n", start, end), text.rfind(". ", start, end), text.rfind(" ", start, end))
+                if cut > start + 300:
+                    end = cut + 1
+            yield start, text[start:end]
+            start = end
+
+    def _bio_predictions_to_entities(self, chunk, chunk_offset, offsets, pred_ids, pred_scores, id2label):
+        entities = []
+        current = None
+
+        for token_offset, pred_id, score in zip(offsets, pred_ids, pred_scores):
+            start, end = token_offset
+            if start == end:
+                continue
+            label = id2label.get(int(pred_id), "O")
+            if label == "O":
+                if current is not None:
+                    entities.append(current)
+                    current = None
+                continue
+
+            prefix, _, entity_label = label.partition("-")
+            if entity_label not in self.target_labels:
+                continue
+
+            abs_start = chunk_offset + start
+            abs_end = chunk_offset + end
+            token_score = float(score)
+            # The trained tokenizer/model can emit B-* for adjacent word pieces.
+            # Trust the contiguous character span more than the BIO prefix here.
+            should_start = current is None or current["entity_group"] != entity_label or abs_start > current["end"] + 1
+
+            if should_start:
+                if current is not None:
+                    entities.append(current)
+                current = {
+                    "entity_group": entity_label,
+                    "label": entity_label,
+                    "word": chunk[start:end],
+                    "start": abs_start,
+                    "end": abs_end,
+                    "score": token_score,
+                    "_scores": [token_score],
+                    "source": "model",
+                }
+            else:
+                current["end"] = abs_end
+                rel_start = current["start"] - chunk_offset
+                rel_end = abs_end - chunk_offset
+                current["word"] = chunk[rel_start:rel_end]
+                current["_scores"].append(token_score)
+                current["score"] = sum(current["_scores"]) / len(current["_scores"])
+
+        if current is not None:
+            entities.append(current)
+
+        cleaned = []
+        for entity in entities:
+            entity.pop("_scores", None)
+            entity["word"] = re.sub(r"\s+", " ", entity["word"]).strip()
+            if entity["word"] and float(entity["score"]) >= self.min_model_confidence:
+                cleaned.append(entity)
+        return cleaned
+
+    def _extract_entities_with_rules(self, text):
+        entities = []
+        seen = set()
+        patterns = {
+            "LAW": [
+                r"[가-힣A-Za-z0-9·\s]{0,20}(?:법|시행령|시행규칙)\s*제?\s*\d+\s*조(?:의\s*\d+)?",
+                r"(?:근로기준법|형법|민법|남녀고용평등법|성폭력범죄의 처벌 등에 관한 특례법|고용보험법|최저임금법)",
+            ],
+            "DATE": [
+                r"\d{4}\s*년\s*\d{1,2}\s*월\s*\d{1,2}\s*일",
+                r"\d{1,2}\s*월\s*\d{1,2}\s*일",
+            ],
+            "AMOUNT": [
+                r"\d[\d,]*\s*(?:원|만원|천원)",
+                r"시급\s*\d[\d,]*",
+            ],
+            "ORG": [
+                r"(?:고용노동부|경찰|검찰청|대법원|법률구조공단|여성긴급전화|학교|대학교)",
+            ],
+            "CRIME": [
+                r"(?:강제추행|성추행|성폭력|성희롱|강간|불법촬영|스토킹|폭행|협박)",
+            ],
+            "PENALTY": [
+                r"\d+\s*년\s*(?:이하|이상)의?\s*징역",
+                r"\d[\d,]*\s*만원\s*(?:이하|이상)의?\s*벌금",
+            ],
+        }
+        for label, regexes in patterns.items():
+            for pattern in regexes:
+                for match in re.finditer(pattern, text):
+                    word = re.sub(r"\s+", " ", match.group(0)).strip()
+                    key = (label, match.start(), match.end(), word)
+                    if not word or key in seen:
+                        continue
+                    seen.add(key)
+                    entities.append(
+                        {
+                            "entity_group": label,
+                            "label": label,
+                            "word": word,
+                            "start": match.start(),
+                            "end": match.end(),
+                            "score": 1.0,
+                        }
+                    )
+        entities.sort(key=lambda item: item["start"])
+        return entities
+
+    def _merge_entity_lists(self, primary, secondary):
+        merged = list(primary)
+        for entity in secondary:
+            overlaps = [
+                existing
+                for existing in merged
+                if existing.get("entity_group") == entity.get("entity_group")
+                and not (entity.get("end", 0) <= existing.get("start", 0) or entity.get("start", 0) >= existing.get("end", 0))
+            ]
+            if overlaps:
+                continue
+            entity = dict(entity)
+            entity.setdefault("source", "rule")
+            merged.append(entity)
+        return self._dedupe_entities(merged)
+
+    def _dedupe_entities(self, entities):
+        deduped = []
+        seen = set()
+        for entity in sorted(entities, key=lambda item: (item.get("start", 0), -(item.get("end", 0) - item.get("start", 0)))):
+            word = re.sub(r"\s+", " ", str(entity.get("word", ""))).strip()
+            if not word:
+                continue
+            key = (entity.get("entity_group"), entity.get("start"), entity.get("end"), word)
+            if key in seen:
+                continue
+            seen.add(key)
+            entity = dict(entity)
+            entity["word"] = word
+            deduped.append(entity)
+        return deduped
+
+    def find_hallucinations(self, answer, rag_docs, found_entities=None):
+        found_entities = found_entities if found_entities is not None else self.extract_entities(answer)
+        candidates_by_label, context_law = self._collect_candidates(rag_docs)
+        hallucinations = []
+
+        for entity in found_entities:
+            label = entity.get("entity_group") or entity.get("label")
+            word = entity.get("word")
+            if label not in {"LAW", "PENALTY", "AMOUNT", "DATE", "CRIME"} or not word:
+                continue
+            candidates = candidates_by_label.get(label, [])
+            if not candidates:
+                continue
+            match = self._match_entity_against_candidates(label, word, candidates, context_law=context_law)
+            if match.get("is_supported"):
+                continue
+            candidate = match.get("candidate")
+            if not candidate:
+                continue
+            if float(match.get("score", 0.0)) < 0.75:
+                continue
+            confidence = 1.0 - float(match.get("confidence", 0.0))
+            hallucinations.append(
+                {
+                    "label": label,
+                    "wrong_word": word,
+                    "correct_word": candidate,
+                    "start": entity.get("start"),
+                    "end": entity.get("end"),
+                    "confidence": max(0.0, min(1.0, confidence)),
+                    "reason_code": match.get("method", "unsupported_entity"),
+                    "reason": "답변의 개체명이 검색 근거 문서에서 충분히 지지되지 않습니다.",
+                }
+            )
+        return hallucinations
+
+    def _collect_candidates(self, rag_docs):
+        text_parts = []
+        law_names = []
+        for doc in rag_docs or []:
+            text = doc.get("text", "") if isinstance(doc, dict) else getattr(doc, "text", "")
+            metadata = doc.get("metadata", {}) if isinstance(doc, dict) else getattr(doc, "metadata", {})
+            text_parts.append(text or "")
+            if isinstance(metadata, dict):
+                for key in ("law_name", "source_file", "article_id", "article_title", "organization"):
+                    value = metadata.get(key)
+                    if value:
+                        text_parts.append(str(value))
+                if metadata.get("law_name"):
+                    law_names.append(str(metadata["law_name"]))
+
+        merged = "\n".join(text_parts)
+        extracted = self.extract_entities(merged)
+        candidates = {label: [] for label in self.target_labels}
+        for entity in extracted:
+            label = entity.get("entity_group")
+            word = entity.get("word")
+            if label in candidates and word:
+                candidates[label].append(word)
+
+        for law in law_names:
+            candidates["LAW"].append(law)
+
+        for label, values in candidates.items():
+            deduped = []
+            seen = set()
+            for value in values:
+                norm = self._normalize_entity_text(value, label)
+                if norm and norm not in seen:
+                    seen.add(norm)
+                    deduped.append(value)
+            candidates[label] = deduped
+
+        context_law = law_names[0] if law_names else ""
+        return candidates, context_law
 
     # --- Normalization ---
     def _normalize_law_text(self, text):
@@ -154,7 +462,7 @@ class NERFactChecker:
         if self._semantic_embedder is None and SentenceTransformer is not None:
             device = "cuda" if (torch is not None and torch.cuda.is_available()) else "cpu"
             try:
-                self._semantic_embedder = SentenceTransformer(config.rag.embedding_model, device=device)
+                self._semantic_embedder = SentenceTransformer(config.rag.embedding_model, device=device, local_files_only=True)
             except Exception:
                 self._semantic_embedder = None
         return self._semantic_embedder
