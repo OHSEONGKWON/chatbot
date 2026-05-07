@@ -66,6 +66,7 @@ LAWSGUARD_NER_MODEL=outputs/legal-ner-lawsguard-v2-30k
 .\.venv\Scripts\python.exe -m pytest -q
 .\.venv\Scripts\python.exe tests\manual_pipeline_test.py
 .\.venv\Scripts\python.exe scripts\evaluate_rag_quality.py
+.\.venv\Scripts\python.exe scripts\evaluate_ner_factcheck.py
 ```
 
 > 현재 저장소 기준 가상환경 폴더는 `.venv`입니다. `venv`를 새로 만들 수도 있지만, 팀 전체가 하나의 이름으로 통일하는 편이 좋습니다.
@@ -93,8 +94,9 @@ LAWSGUARD_NER_MODEL=outputs/legal-ner-lawsguard-v2-30k
 
 5. **NER 환각 탐지 (NER Hallucination Detection)** - `src/modules/ner_checker.py`
    - 개체명 인식 (NER 모델)
-   - RAG 문서와 대조 (하이브리드 매칭: 정확/퍼지/의미)
-   - 환각 수정
+   - RAG 문서와 대조 (정확/퍼지/의미 매칭)
+   - 법률명과 조문 번호를 함께 검증 (`근로기준법 제43조`와 `제37조`를 구분)
+   - high-risk 조문 오류만 보수적으로 자동 수정
 
 6. **답변 최종화 (Formatting)** - `src/modules/answer_formatter.py`
    - 최종 답변 생성 (구조화된 형식)
@@ -102,12 +104,21 @@ LAWSGUARD_NER_MODEL=outputs/legal-ner-lawsguard-v2-30k
 ## 주요 기능
 
 ### NER 환각 탐지 (Hybrid Matching)
-- **정규화**: 날짜/금액 숫자 표준화, 별칭 처리
+- **정규화**: 날짜/금액 숫자 표준화, 법률 별칭 처리, 조문 번호 보존
 - **세 단계 매칭**:
   1. 정확 매칭 (Exact)
   2. 퍼지 매칭 (Fuzzy) - 90% 이상
   3. 의미적 유사도 (Semantic) - 임베딩 기반
-- **보수적 정책**: 숫자형(DATE/AMOUNT)은 strict numeric만 허용
+- **보수적 정책**: 숫자형(DATE/AMOUNT)은 strict numeric만 허용하고, 기관명(ORG)은 자동 수정 대상에서 제외
+- **검증 지표**: `scripts/evaluate_ner_factcheck.py`로 답변-근거 쌍 기준 precision/recall/F1을 확인
+
+### NER 모델 재학습
+```bash
+.\.venv\Scripts\python.exe scripts\train_legal_ner.py --base-model outputs\legal-ner-lawsguard-v2-30k --output-dir outputs\legal-ner-lawsguard-v3 --epochs 3 --batch-size 8
+```
+- 학습 데이터: `data/real_bio_data/**`와 `data/hallucination_data/**`의 BIO JSONL
+- 산출 지표: token F1과 entity-span F1을 `outputs/<model>/metrics.json`에 저장
+- 새 모델 적용: `.env`의 `LAWSGUARD_NER_MODEL`을 새 output 경로로 변경
 
 ### 재질문 로직
 - LLM + 컨텍스트 휴리스틱 기반

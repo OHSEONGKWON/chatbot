@@ -98,6 +98,7 @@ class NERFactChecker:
         # Matching thresholds
         self.fuzzy_threshold = 0.90
         self.semantic_threshold = 0.82
+        self.hallucination_report_threshold = 0.72
         self.enable_semantic_match = os.getenv("LAWSGUARD_ENABLE_SEMANTIC_NER", "0") == "1"
         self.semantic_allowed_labels = {"CRIME", "PENALTY"}
 
@@ -350,9 +351,13 @@ class NERFactChecker:
             candidate = match.get("candidate")
             if not candidate:
                 continue
-            if float(match.get("score", 0.0)) < 0.75:
+            if float(match.get("score", 0.0)) < self.hallucination_report_threshold:
                 continue
-            confidence = 1.0 - float(match.get("confidence", 0.0))
+            support_score = max(0.0, min(1.0, float(match.get("confidence", 0.0))))
+            replacement_confidence = self._replacement_confidence(label, word, candidate, match)
+            risk_level = self._risk_level(label, support_score, match)
+            if risk_level == "low" and replacement_confidence <= 0.0:
+                continue
             hallucinations.append(
                 {
                     "label": label,
@@ -360,7 +365,10 @@ class NERFactChecker:
                     "correct_word": candidate,
                     "start": entity.get("start"),
                     "end": entity.get("end"),
-                    "confidence": max(0.0, min(1.0, confidence)),
+                    "confidence": replacement_confidence,
+                    "support_score": support_score,
+                    "match_score": float(match.get("score", 0.0)),
+                    "risk_level": risk_level,
                     "reason_code": match.get("method", "unsupported_entity"),
                     "reason": "답변의 개체명이 검색 근거 문서에서 충분히 지지되지 않습니다.",
                 }
@@ -381,6 +389,9 @@ class NERFactChecker:
                         text_parts.append(str(value))
                 if metadata.get("law_name"):
                     law_names.append(str(metadata["law_name"]))
+                    article = metadata.get("article_id") or metadata.get("article_title")
+                    if article:
+                        text_parts.append(f"{metadata['law_name']} {article}")
 
         merged = "\n".join(text_parts)
         extracted = self.extract_entities(merged)
@@ -412,17 +423,37 @@ class NERFactChecker:
         if not text:
             return ""
         t = text.strip().lower()
-        t = re.sub(r'제\s*\d+(?:조|항|절)', '', t)
         t = re.sub(r'\([^)]*\)', '', t)
         t = re.sub(r'\s+', ' ', t).strip()
 
         law_abbreviations = {
             "근기": "근로기준법",
+            "근기법": "근로기준법",
             "근로": "근로기준법",
             "산안": "산업안전보건법",
+            "산안법": "산업안전보건법",
             "성폭": "성폭력범죄의처벌등에관한특례법",
+            "성폭법": "성폭력범죄의처벌등에관한특례법",
+            "성폭력처벌법": "성폭력범죄의처벌등에관한특례법",
+            "성폭력특례법": "성폭력범죄의처벌등에관한특례법",
         }
-        return law_abbreviations.get(t, t)
+        compact = re.sub(r"[\s·ㆍ,.\-()「」『』<>\[\]]+", "", t)
+        if compact in law_abbreviations:
+            return law_abbreviations[compact]
+        for alias, canonical in sorted(law_abbreviations.items(), key=lambda item: len(item[0]), reverse=True):
+            if canonical in compact:
+                continue
+            compact = compact.replace(alias, canonical)
+        return compact
+
+    def _law_article_key(self, text):
+        compact = self._normalize_law_text(text)
+        match = re.search(r"제\d+조(?:제\d+항)?(?:제\d+호)?", compact)
+        return match.group(0) if match else ""
+
+    def _law_name_key(self, text):
+        compact = self._normalize_law_text(text)
+        return re.sub(r"제\d+조(?:제\d+항)?(?:제\d+호)?", "", compact)
 
     def _normalize_entity_text(self, text, label=None):
         if not isinstance(text, str):
@@ -541,6 +572,39 @@ class NERFactChecker:
                 exact_confidence = 1.0 * combo_score
                 return {"is_supported": True, "candidate": cand, "method": "exact", "score": 1.0, "confidence": exact_confidence, "combo_score": combo_score}
 
+            if label == "LAW":
+                word_law = self._law_name_key(word)
+                cand_law = self._law_name_key(cand)
+                word_article = self._law_article_key(word)
+                cand_article = self._law_article_key(cand)
+                if word_law and cand_law and word_law == cand_law:
+                    if word_article and cand_article and word_article != cand_article:
+                        score = 0.93
+                        confidence = score * combo_score
+                        if confidence > best["confidence"]:
+                            best = {
+                                "is_supported": False,
+                                "candidate": cand,
+                                "method": "same_law_article_mismatch",
+                                "score": score,
+                                "confidence": confidence,
+                                "combo_score": combo_score,
+                            }
+                        continue
+                    if not word_article or not cand_article:
+                        score = 0.88
+                        confidence = score * combo_score
+                        if confidence > best["confidence"]:
+                            best = {
+                                "is_supported": False,
+                                "candidate": cand,
+                                "method": "law_name_only",
+                                "score": score,
+                                "confidence": confidence,
+                                "combo_score": combo_score,
+                            }
+                        continue
+
             # fuzzy
             fuzzy = self._fuzzy_ratio(norm_word, norm_cand)
             allow_semantic = self.enable_semantic_match and label in self.semantic_allowed_labels
@@ -548,21 +612,42 @@ class NERFactChecker:
             if allow_semantic and fuzzy < fuzzy_threshold:
                 semantic = self._semantic_similarity(word, cand)
 
-            weighted_score = 0.5 * (1.0 if fuzzy == 1.0 else 0.0) + 0.3 * fuzzy + 0.2 * semantic
-            weighted_confidence = weighted_score * combo_score
+            match_score = max(fuzzy, semantic)
+            weighted_confidence = match_score * combo_score
 
             if weighted_confidence > best["confidence"]:
-                best = {"is_supported": False, "candidate": cand, "method": ("fuzzy" if fuzzy >= semantic else "semantic"), "score": (fuzzy if fuzzy >= semantic else semantic), "confidence": weighted_confidence, "combo_score": combo_score}
+                best = {"is_supported": False, "candidate": cand, "method": ("fuzzy" if fuzzy >= semantic else "semantic"), "score": match_score, "confidence": weighted_confidence, "combo_score": combo_score}
 
         if best["method"] == "fuzzy" and best["score"] >= fuzzy_threshold:
-            if best["confidence"] >= 0.95:
+            if best["confidence"] >= fuzzy_threshold:
                 best["is_supported"] = True
             return best
         if best["method"] == "semantic" and best["score"] >= semantic_threshold:
-            if best["confidence"] >= 0.95:
+            if best["confidence"] >= semantic_threshold:
                 best["is_supported"] = True
             return best
         return best
+
+    def _replacement_confidence(self, label, word, candidate, match):
+        method = match.get("method")
+        score = float(match.get("score", 0.0))
+        if label == "LAW" and method == "same_law_article_mismatch":
+            word_law = self._law_name_key(word)
+            cand_law = self._law_name_key(candidate)
+            if word_law and word_law == cand_law and self._law_article_key(word) and self._law_article_key(candidate):
+                return 0.98
+        if label in {"CRIME", "PENALTY"} and method in {"fuzzy", "semantic"} and score >= 0.96:
+            return 0.90
+        return 0.0
+
+    def _risk_level(self, label, support_score, match):
+        if label == "LAW" and match.get("method") == "same_law_article_mismatch":
+            return "high"
+        if support_score < 0.35:
+            return "high"
+        if support_score < 0.75:
+            return "medium"
+        return "low"
 
     def debug_match_entity(self, label, word, candidates, context_law=None):
         return self._match_entity_against_candidates(label=label, word=word, candidates=candidates, context_law=context_law)
