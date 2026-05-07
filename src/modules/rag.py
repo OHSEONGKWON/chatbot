@@ -21,6 +21,74 @@ class RAGDocument:
     retrieval_reason: str = ""
 
 
+ISSUE_SPECS: dict[str, dict[str, Any]] = {
+    "wage_unpaid": {
+        "category": "노동",
+        "triggers": ["임금체불", "체불", "알바비", "월급", "급여", "못 받", "안 줬", "미지급", "임금 못"],
+        "expand": "임금체불 임금 지급 근로기준법 제43조 제36조 제37조 고용노동부 진정",
+        "preferred": ["근로기준법 제43조", "제43조", "임금은", "임금 지급", "임금체불", "체불"],
+        "secondary": ["제36조", "제37조", "고용노동부", "진정"],
+        "penalty": ["성희롱", "성폭력", "강제추행", "불법촬영"],
+    },
+    "minimum_wage": {
+        "category": "노동",
+        "triggers": ["최저임금", "최저시급", "시급이 낮", "시급 적", "최저보다", "최저 임금"],
+        "expand": "최저임금 최저임금법 제6조 최저시급 미달 임금",
+        "preferred": ["최저임금법", "제6조", "최저임금", "최저시급"],
+        "secondary": ["임금", "근로자"],
+        "penalty": ["성희롱", "성폭력", "강제추행"],
+    },
+    "dismissal": {
+        "category": "노동",
+        "triggers": ["해고", "잘렸", "그만 나오", "그만두라", "부당해고", "해고예고", "서면 통지"],
+        "expand": "해고 부당해고 근로기준법 제23조 제26조 제27조 해고예고 서면통지 노동위원회",
+        "preferred": ["근로기준법 제23조", "제23조", "부당해고", "정당한 이유"],
+        "secondary": ["제26조", "해고예고", "제27조", "서면", "노동위원회"],
+        "penalty": ["임금체불", "강제추행", "성폭력"],
+    },
+    "missing_contract": {
+        "category": "노동",
+        "triggers": ["근로계약서", "계약서 안", "계약서 없", "계약서 미작성", "서면 계약", "근로조건", "근무시간", "구두로", "구두 조건"],
+        "expand": "근로계약서 근로조건 서면 명시 근로기준법 제17조 계약서 미작성",
+        "preferred": ["근로기준법 제17조", "제17조", "근로조건", "서면", "근로계약서"],
+        "secondary": ["명시", "계약서"],
+        "penalty": ["성희롱", "성폭력"],
+    },
+    "workplace_harassment": {
+        "category": "노동",
+        "triggers": ["직장 내 괴롭힘", "직장내 괴롭힘", "괴롭힘", "폭언", "따돌림", "모욕", "갑질"],
+        "expand": "직장 내 괴롭힘 근로기준법 제76조의2 제76조의3 예방 대응 매뉴얼",
+        "preferred": ["근로기준법 제76조의2", "제76조의2", "직장 내 괴롭힘"],
+        "secondary": ["제76조의3", "예방", "대응 매뉴얼", "조치"],
+        "penalty": ["강제추행", "불법촬영"],
+    },
+    "sexual_harassment": {
+        "category": "성폭력",
+        "triggers": ["성희롱", "성적 농담", "외모 평가", "성적 발언", "음담패설"],
+        "expand": "성희롱 신고 상담 양성평등기본법 제30조 공공부문 성희롱 성폭력 사건 처리 매뉴얼",
+        "preferred": ["성희롱", "양성평등기본법 제30조", "제30조", "상담 및 신고 접수"],
+        "secondary": ["공공부문 성희롱 성폭력 사건 처리 매뉴얼", "신고", "상담"],
+        "penalty": ["임금체불", "최저임금", "해고"],
+    },
+    "indecent_assault": {
+        "category": "성폭력",
+        "triggers": ["강제추행", "성추행", "동의 없이 몸", "몸을 만", "허리를 만", "가슴", "엉덩이", "입맞춤"],
+        "expand": "강제추행 형법 제298조 동의 없는 신체접촉 성폭력 피해자 보호 상담 신고",
+        "preferred": ["형법 제298조", "제298조", "강제추행"],
+        "secondary": ["성폭력", "신체접촉", "상담", "신고"],
+        "penalty": ["임금체불", "최저임금", "해고"],
+    },
+    "illegal_filming": {
+        "category": "성폭력",
+        "triggers": ["불법촬영", "몰카", "몰래 촬영", "동의 없이 사진", "동의 없이 영상", "찍은 영상", "카메라", "촬영물", "유포", "단톡방"],
+        "expand": "불법촬영 카메라 촬영 성폭력범죄의 처벌 등에 관한 특례법 제14조 촬영물 반포",
+        "preferred": ["성폭력범죄의 처벌 등에 관한 특례법 제14조", "제14조", "카메라", "촬영"],
+        "secondary": ["촬영물", "반포", "복제물", "불법촬영"],
+        "penalty": ["임금체불", "해고", "강제추행"],
+    },
+}
+
+
 class LegalRetriever:
     def __init__(self):
         self._collection = None
@@ -119,7 +187,8 @@ class LegalRetriever:
 
     def _retrieve_from_jsonl(self, query: str, top_k: int, legal_category: str = "") -> list[RAGDocument]:
         category = legal_category or self._infer_category(query)
-        query_tokens = self._expand_query_tokens(query, category)
+        issues = self.infer_issues(query, category=category)
+        query_tokens = self._expand_query_tokens(query, category, issues=issues)
         if not query_tokens:
             return []
         self._ensure_bm25_index()
@@ -130,7 +199,8 @@ class LegalRetriever:
             bm25 = self._bm25_score(query_tokens, doc_tokens, token_counts)
             if bm25 <= 0:
                 continue
-            score = bm25 + self._domain_boost(query, haystack, category) + self._metadata_boost(doc.metadata, category)
+            issue_boost, issue_reasons = self._issue_boost(haystack, doc.metadata, issues)
+            score = bm25 + self._domain_boost(query, haystack, category) + self._metadata_boost(doc.metadata, category) + issue_boost
             score -= self._cross_domain_penalty(haystack, category)
             if score > 0:
                 scored.append(
@@ -139,11 +209,11 @@ class LegalRetriever:
                         metadata=doc.metadata,
                         chunk_id=doc.chunk_id,
                         score=score,
-                        retrieval_reason=f"bm25={bm25:.2f}, category={category or 'unknown'}",
+                        retrieval_reason=f"bm25={bm25:.2f}, category={category or 'unknown'}, issues={','.join(issues) or 'none'}{issue_reasons}",
                     )
                 )
         scored.sort(key=lambda doc: doc.score, reverse=True)
-        return self._balance_sources(scored, top_k, category)
+        return self._balance_sources(scored, top_k, category, issues=issues)
 
     def _ensure_bm25_index(self):
         if self._bm25_index is not None:
@@ -190,7 +260,7 @@ class LegalRetriever:
     def _tokenize_for_index(self, text: str) -> list[str]:
         return re.findall(r"[0-9A-Za-z가-힣]{2,}", text.lower())
 
-    def _expand_query_tokens(self, text: str, category: str = "") -> list[str]:
+    def _expand_query_tokens(self, text: str, category: str = "", issues: list[str] | None = None) -> list[str]:
         tokens = self._tokenize_for_index(text)
         aliases = {
             "알바": "근로 임금 아르바이트 근로계약서 사업주",
@@ -213,6 +283,8 @@ class LegalRetriever:
             tokens.extend("근로기준법 임금 근로계약서 고용노동부 사업주 지급".split())
         elif category == "성폭력":
             tokens.extend("성폭력 성희롱 강제추행 피해자 보호 상담 신고 동의".split())
+        for issue in issues or []:
+            tokens.extend(str(ISSUE_SPECS.get(issue, {}).get("expand", "")).split())
         return tokens
 
     def _lexical_score(self, terms: set[str], text: str) -> float:
@@ -279,6 +351,45 @@ class LegalRetriever:
                 boost -= 3.0
         return boost
 
+    def infer_issues(self, query: str, category: str = "") -> list[str]:
+        normalized = re.sub(r"\s+", " ", query.lower())
+        scored: list[tuple[int, str]] = []
+        for issue, spec in ISSUE_SPECS.items():
+            if category and spec.get("category") != category:
+                continue
+            score = sum(1 for trigger in spec.get("triggers", []) if trigger.lower() in normalized)
+            if score:
+                scored.append((score, issue))
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        return [issue for _, issue in scored[:3]]
+
+    def _issue_boost(self, text: str, metadata: dict[str, Any], issues: list[str]) -> tuple[float, str]:
+        if not issues:
+            return 0.0, ""
+        haystack = f"{text} {json.dumps(metadata, ensure_ascii=False)}".lower()
+        compact = re.sub(r"\s+", "", haystack)
+        boost = 0.0
+        reasons = []
+        for issue in issues:
+            spec = ISSUE_SPECS.get(issue, {})
+            issue_boost = 0.0
+            for term in spec.get("preferred", []):
+                if term.lower() in haystack or re.sub(r"\s+", "", term.lower()) in compact:
+                    issue_boost += 9.0
+            for term in spec.get("secondary", []):
+                if term.lower() in haystack or re.sub(r"\s+", "", term.lower()) in compact:
+                    issue_boost += 3.0
+            for term in spec.get("penalty", []):
+                if term.lower() in haystack or re.sub(r"\s+", "", term.lower()) in compact:
+                    issue_boost -= 5.0
+            source_type = str(metadata.get("source_type") or "")
+            if source_type == "case":
+                issue_boost -= 2.0
+            if issue_boost:
+                boost += issue_boost
+                reasons.append(f"{issue}:{issue_boost:.1f}")
+        return boost, f", issue_boost={';'.join(reasons)}" if reasons else ""
+
     def _cross_domain_penalty(self, text: str, category: str) -> float:
         if category == "노동":
             sexual_hits = sum(text.count(term) for term in ["성폭력", "성희롱", "강제추행", "성범죄"])
@@ -294,11 +405,15 @@ class LegalRetriever:
                 return 14.0
         return 0.0
 
-    def _balance_sources(self, docs: list[RAGDocument], top_k: int, category: str) -> list[RAGDocument]:
+    def _balance_sources(self, docs: list[RAGDocument], top_k: int, category: str, issues: list[str] | None = None) -> list[RAGDocument]:
         selected = []
         preferred_slots = ["statute", "manual", "statute"]
         if category == "성폭력":
             preferred_slots = ["manual", "statute", "manual"]
+        if issues and any(issue in {"wage_unpaid", "minimum_wage", "dismissal", "missing_contract", "indecent_assault", "illegal_filming"} for issue in issues):
+            preferred_slots = ["statute", "manual", "statute"]
+        if issues and "workplace_harassment" in issues:
+            preferred_slots = ["statute", "manual", "manual"]
 
         remaining = list(docs)
         for wanted in preferred_slots:
