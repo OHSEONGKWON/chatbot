@@ -38,6 +38,15 @@ class LegalReasoningValidator:
         if llm_client.available:
             llm_result = await self._llm_validate(question, heuristic.validated_answer, rag_docs, legal_category)
             if llm_result is not None:
+                post_check = self._heuristic_validate(question, llm_result.validated_answer, rag_docs, legal_category)
+                if post_check.issues or post_check.score < llm_result.score:
+                    return LegalReasoningResult(
+                        original_answer=answer,
+                        validated_answer=post_check.validated_answer,
+                        score=min(llm_result.score, post_check.score),
+                        issues=llm_result.issues + post_check.issues,
+                        used_llm=True,
+                    )
                 return llm_result
         return heuristic
 
@@ -86,9 +95,10 @@ class LegalReasoningValidator:
     ) -> LegalReasoningResult:
         issues: list[LegalReasoningIssue] = []
         support_text = self._support_text(rag_docs)
+        source_refs = self._source_ref_keys(rag_docs)
 
         cited_refs = self._extract_law_refs(answer)
-        unsupported = [ref for ref in cited_refs if not self._ref_supported(ref, support_text)]
+        unsupported = [ref for ref in cited_refs if not self._ref_supported(ref, support_text, source_refs)]
         for ref in unsupported:
             issues.append(
                 LegalReasoningIssue(
@@ -117,7 +127,8 @@ class LegalReasoningValidator:
             )
 
         score = max(0.25, 1.0 - 0.18 * sum(1 for issue in issues if issue.severity == "error") - 0.08 * sum(1 for issue in issues if issue.severity != "error"))
-        validated = self._soften_overclaims(answer) if issues else answer
+        validated = self._mask_unsupported_refs(answer, unsupported)
+        validated = self._soften_overclaims(validated) if issues else validated
         validated = self._apply_issue_appendix(validated, issues)
         return LegalReasoningResult(
             original_answer=answer,
@@ -220,16 +231,45 @@ class LegalReasoningValidator:
         false_fragments = ["관련법", "대한법", "법률구조", "법률상담", "법률정보", "법리"]
         return any(fragment in compact for fragment in false_fragments)
 
-    def _ref_supported(self, ref: str, support_text: str) -> bool:
+    def _source_ref_keys(self, rag_docs: list[dict[str, Any]]) -> set[str]:
+        refs = set()
+        for doc in rag_docs:
+            metadata = doc.get("metadata") or {}
+            law = metadata.get("law_name") or ""
+            article = metadata.get("article_id") or metadata.get("article_title") or ""
+            law_key = self._normalize_ref(str(law))
+            article_match = re.search(r"제\d+조(?:의\d+)?", self._normalize_ref(str(article)))
+            if law_key and article_match:
+                refs.add(f"{law_key}{article_match.group(0)}")
+            if law_key:
+                refs.add(law_key)
+        return refs
+
+    def _ref_supported(self, ref: str, support_text: str, source_refs: set[str] | None = None) -> bool:
         norm_ref = self._normalize_ref(ref)
         norm_support = self._normalize_ref(support_text)
+        source_refs = source_refs or set()
         if norm_ref in norm_support:
-            return True
+            if not source_refs:
+                return True
         article_match = re.search(r"제\d+조(?:의\d+)?", norm_ref)
-        if article_match and article_match.group(0) in norm_support:
-            return True
         law_name = re.sub(r"제\d+조(?:의\d+)?", "", norm_ref).strip()
+        if article_match:
+            article = article_match.group(0)
+            if law_name:
+                return f"{law_name}{article}" in source_refs
+            return any(key.endswith(article) for key in source_refs)
+        if source_refs and law_name:
+            return law_name in source_refs
         return bool(law_name and law_name in norm_support)
+
+    def _mask_unsupported_refs(self, answer: str, unsupported_refs: list[str]) -> str:
+        masked = answer
+        for ref in sorted(set(unsupported_refs), key=len, reverse=True):
+            if not ref:
+                continue
+            masked = masked.replace(ref, "검색 근거에서 직접 확인되지 않은 조문")
+        return masked
 
     def _normalize_ref(self, text: str) -> str:
         return re.sub(r"\s+", "", text or "")

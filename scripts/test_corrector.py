@@ -1,4 +1,9 @@
-from modules.corrector import AnswerCorrector
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from src.modules.corrector import AnswerCorrector
 s = "피고인은 형법 제298조에 따라 처벌을 받는다. 대법원 판결을 인용한다."
 halls = [
     {"wrong_word":"형법 제298조","correct_word":"형법","start":4,"end":12,"confidence":0.98},

@@ -49,6 +49,10 @@ class NERCheckResult:
     mismatched_entities: list[dict]
     was_corrected: bool
 
+    @property
+    def hallucinations(self):
+        return self.mismatched_entities
+
 
 class NERFactChecker:
     """Lightweight NER fact checker with law normalization, domain checks, and confidence scoring.
@@ -110,6 +114,13 @@ class NERFactChecker:
 
     async def check_and_correct(self, answer, rag_docs):
         return await asyncio.to_thread(self.check_and_correct_sync, answer, rag_docs)
+
+    async def check(self, answer, rag_docs):
+        return await self.check_and_correct(answer, rag_docs)
+
+    async def warmup(self):
+        await asyncio.to_thread(self._load_ner_model)
+        await asyncio.to_thread(self._load_semantic_embedder)
 
     def check_and_correct_sync(self, answer, rag_docs):
         found_entities = self.extract_entities(answer)
@@ -379,8 +390,12 @@ class NERFactChecker:
         text_parts = []
         law_names = []
         for doc in rag_docs or []:
-            text = doc.get("text", "") if isinstance(doc, dict) else getattr(doc, "text", "")
-            metadata = doc.get("metadata", {}) if isinstance(doc, dict) else getattr(doc, "metadata", {})
+            if isinstance(doc, dict):
+                text = doc.get("text") or doc.get("content", "")
+                metadata = doc.get("metadata", {})
+            else:
+                text = getattr(doc, "text", "")
+                metadata = getattr(doc, "metadata", {})
             text_parts.append(text or "")
             if isinstance(metadata, dict):
                 for key in ("law_name", "source_file", "article_id", "article_title", "organization"):

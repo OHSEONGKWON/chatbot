@@ -22,7 +22,9 @@ logger = logging.getLogger("lawsguard")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     cleanup_task = asyncio.create_task(_session_cleanup_loop())
+    warmup_task = asyncio.create_task(_warmup_components())
     logger.info("LawsGuard 서버 시작")
+    await warmup_task
     yield
     cleanup_task.cancel()
     logger.info("LawsGuard 서버 종료")
@@ -33,6 +35,18 @@ async def _session_cleanup_loop():
         await asyncio.sleep(1800)
         session_store.cleanup_expired()
         logger.info("만료 세션 정리 완료")
+
+
+async def _warmup_components():
+    try:
+        await asyncio.gather(
+            pipeline._retriever.warmup(),
+            pipeline._consistency.warmup(),
+            pipeline._ner.warmup(),
+        )
+        logger.info("핵심 모델 워밍업 완료")
+    except Exception as e:
+        logger.warning(f"모델 워밍업 실패: {e}")
 
 
 app = FastAPI(title="LawsGuard API", description="RAG 기반 한국 법률 상담 챗봇 스킬 서버", version="1.0.0", lifespan=lifespan)

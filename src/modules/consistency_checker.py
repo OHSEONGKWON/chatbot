@@ -1,81 +1,141 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import re
+import statistics
+from collections import OrderedDict
 from difflib import SequenceMatcher
 from typing import Any
+
+import numpy as np
+
+try:
+    from sentence_transformers import SentenceTransformer
+except Exception:
+    SentenceTransformer = None
 
 from ..config import config
 from .llm_client import llm_client
 
 
+DEFAULT_SIMILAR_QUESTIONS = 3
+MAX_SIMILAR_QUESTIONS = 10
+
+
+SIMILAR_Q_SYSTEM = """당신은 법률 전문가입니다.
+사용자 질문과 의미가 유사하지만 표현이 다른 질문을 정확히 {n}개 생성하세요.
+반드시 JSON 배열로만 응답하세요."""
+
+SIMILAR_Q_USER = """다음 질문과 의미가 유사한 법률 질문 {n}개를 생성하세요.
+표현, 어휘, 문장 구조를 다양하게 바꾸되 핵심 법률 쟁점은 유지하세요.
+
+[원본 질문]: {question}
+
+응답 형식: ["질문1", "질문2", ..., "질문{n}"]"""
+
+RAG_ANSWER_SYSTEM = """당신은 대한민국 법률 전문가입니다.
+주어진 법률 참고 자료를 바탕으로 질문에 정확하고 간결하게 답변하세요.
+참고 자료에 없는 조항번호·판례번호·형량·벌금액은 만들지 마세요.
+사용자에게 유리한 결론도 사실관계가 부족하면 가능성으로 낮춰야 합니다."""
+
+RAG_ANSWER_USER = """[법률 참고 자료]
+{context}
+
+[질문]
+{question}
+
+위 참고 자료를 바탕으로 답변하세요."""
+
+
 class ConsistencyChecker:
-    async def run(self, question: str, rag_docs: list[dict[str, Any]] | None = None, legal_category: str = ""):
-        rag_docs = rag_docs or []
-        category = legal_category or self._classify(question)
-        original_answer = await self._answer(question, rag_docs, category)
+    def __init__(self):
+        cfg = config.hallucination
+        requested = int(getattr(cfg, "num_similar_questions", DEFAULT_SIMILAR_QUESTIONS) or DEFAULT_SIMILAR_QUESTIONS)
+        self.n_questions = max(1, min(requested, MAX_SIMILAR_QUESTIONS))
+        self.threshold = cfg.consistency_threshold
+        self._embedder = None
+        self._embedder_name = config.rag.embedding_model
+        self._similar_questions_cache: OrderedDict[str, list[str]] = OrderedDict()
+        self._similar_questions_cache_size = 32
 
-        if not llm_client.available:
-            score = 0.75 if original_answer else 0.0
-            return bool(original_answer), original_answer, score, {"mode": "offline_fallback"}
+    @staticmethod
+    def _get_device() -> str:
+        try:
+            import torch
+            return "cuda" if torch.cuda.is_available() else "cpu"
+        except Exception:
+            return "cpu"
 
-        variants = await self._generate_variants(question)
-        if not variants:
-            return True, original_answer, 0.85, {"mode": "single_answer"}
+    def _load_embedder(self):
+        if self._embedder is not None:
+            return self._embedder
+        if SentenceTransformer is None:
+            return None
+        try:
+            self._embedder = SentenceTransformer(self._embedder_name, device=self._get_device())
+        except Exception:
+            try:
+                self._embedder = SentenceTransformer(config.rag.embedding_model, device=self._get_device())
+            except Exception:
+                self._embedder = None
+        return self._embedder
 
-        variant_prompts = [self._answer_prompt(variant, rag_docs, category) for variant in variants]
-        answers = await llm_client.complete_many(variant_prompts, system=self._system_prompt())
-        answers = [answer for answer in answers if answer]
-        if not answers:
-            return True, original_answer, 0.70, {"mode": "variant_generation_failed"}
+    async def generate_similar_questions(self, question: str) -> list[str]:
+        cache_key = re.sub(r"\s+", " ", (question or "")).strip().lower()
+        cached = self._similar_questions_cache.get(cache_key)
+        if cached is not None:
+            self._similar_questions_cache.move_to_end(cache_key)
+            return list(cached)
 
-        scores = [self._text_similarity(original_answer, answer) for answer in answers]
-        avg_score = sum(scores) / len(scores)
-        return (
-            avg_score >= config.hallucination.consistency_threshold,
-            original_answer,
-            avg_score,
-            {"variants": variants, "scores": scores},
+        raw = await llm_client.complete(
+            system_prompt=SIMILAR_Q_SYSTEM.format(n=self.n_questions),
+            user_prompt=SIMILAR_Q_USER.format(n=self.n_questions, question=question),
+            temperature=0.8,
+            json_mode=True,
+            model=llm_client.clarify_model,
         )
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                questions = [str(q).strip() for q in parsed if str(q).strip()]
+            elif isinstance(parsed, dict):
+                questions = [str(q).strip() for q in parsed.get("questions", []) if str(q).strip()]
+            else:
+                questions = []
+            questions = questions[: self.n_questions]
+            while len(questions) < self.n_questions:
+                questions.append(question)
+            self._similar_questions_cache[cache_key] = list(questions)
+            self._similar_questions_cache.move_to_end(cache_key)
+            while len(self._similar_questions_cache) > self._similar_questions_cache_size:
+                self._similar_questions_cache.popitem(last=False)
+            return questions
+        except Exception:
+            return [question] * self.n_questions
 
-    async def _generate_variants(self, question: str) -> list[str]:
-        prompt = (
-            f"다음 법률 상담 질문의 의미를 유지하되 표현만 다르게 {config.hallucination.num_similar_questions}개 작성하세요.\n"
-            "각 문장은 한 줄에 하나씩만 출력하세요.\n\n"
-            f"질문: {question}"
-        )
-        text = await llm_client.complete(prompt, system="너는 한국어 법률 상담 질문을 의미 보존 방식으로 재작성한다.", max_tokens=1024)
-        variants = []
-        for line in text.splitlines():
-            line = re.sub(r"^\s*[-*\d.)]+\s*", "", line).strip()
-            if line:
-                variants.append(line)
-        return variants[: config.hallucination.num_similar_questions]
+    async def warmup(self):
+        await asyncio.to_thread(self._load_embedder)
 
-    async def _answer(self, question: str, rag_docs: list[dict[str, Any]], category: str) -> str:
-        if llm_client.available:
-            answer = await llm_client.complete(self._answer_prompt(question, rag_docs, category), system=self._system_prompt())
-            if answer:
-                return answer
-        return self._fallback_answer(question, rag_docs, category)
+    def _comparison_text(self, text: str) -> str:
+        if not text:
+            return ""
 
-    def _system_prompt(self) -> str:
-        return (
-            "너는 대학생을 돕는 한국 법률 상담 챗봇이다. 성폭력 및 노동 문제에 대해 답한다. "
-            "제공된 근거 문서 안에서만 단정하고, 근거가 부족하면 불확실하다고 말한다. "
-            "변호사 선임이 필요한 사안, 긴급 위험, 신고/상담 기관 연결 필요성을 분명히 안내한다."
-        )
+        lines: list[str] = []
+        for raw_line in str(text).splitlines():
+            line = re.sub(r"^\s*\d+\s*[\).:]\s*", "", raw_line).strip()
+            line = re.sub(r"^\s*[-*•]\s*", "", line).strip()
+            if not line:
+                continue
+            if line in {"상황 정리", "근거에서 확인한 내용", "지금 할 일", "주의사항"}:
+                continue
+            if line.startswith("이 답변은"):
+                continue
+            lines.append(line)
 
-    def _answer_prompt(self, question: str, rag_docs: list[dict[str, Any]], category: str = "") -> str:
-        context = self._format_docs(rag_docs)
-        return (
-            "아래 근거 문서를 바탕으로 사용자 질문에 답하세요.\n"
-            "답변 형식: 1) 상황 정리 2) 관련 법률 쟁점 3) 근거에서 확인한 내용 4) 지금 할 일 5) 주의사항.\n"
-            "근거 문서에 없는 조문, 판례번호, 금액, 형량은 만들지 마세요.\n"
-            "사용자에게 유리한 결론을 단정하지 말고, 필요한 추가 사실과 증거를 분리해서 말하세요.\n\n"
-            f"[분류]\n{category or '미확정'}\n\n"
-            f"[사용자 질문]\n{question}\n\n"
-            f"[근거 문서]\n{context}"
-        )
+        compact = " ".join(lines)
+        compact = re.sub(r"\s+", " ", compact).strip().lower()
+        return compact
 
     def _format_docs(self, rag_docs: list[dict[str, Any]]) -> str:
         if not rag_docs:
@@ -90,112 +150,54 @@ class ConsistencyChecker:
             blocks.append(f"[{i}] {title} ({source_type}) {reason}\n{text[:1200]}")
         return "\n\n".join(blocks)
 
-    def _fallback_answer(self, question: str, rag_docs: list[dict[str, Any]], legal_category: str = "") -> str:
-        if not rag_docs:
-            return (
-                "현재 질문과 직접 연결되는 근거 문서를 찾지 못했습니다. "
-                "사실관계가 더 필요하므로 발생 시점, 장소/관계, 구체적 행위, 증거 유무를 알려주세요."
-            )
-        category = legal_category or self._classify(question)
-        facts = self._summarize_user_facts(question, category)
-        issue = self._issue_summary(category)
-        evidence = self._evidence_guidance(category)
-        actions = self._action_guidance(category)
-        if category == "성폭력":
-            risk = "상대방과의 접촉이 계속되거나 보복 위험이 있으면 안전 확보와 긴급 신고를 우선하세요."
-        else:
-            risk = "임금채권은 시간 경과에 따라 증거 확보가 어려워질 수 있으니 자료를 먼저 정리하세요."
+    async def _generate_single_answer(self, question: str, rag_docs: list[dict[str, Any]], category: str = "") -> str:
+        context = self._format_docs(rag_docs)
+        answer = await llm_client.complete(
+            system_prompt=RAG_ANSWER_SYSTEM,
+            user_prompt=RAG_ANSWER_USER.format(context=context, question=question),
+            temperature=0.1,
+            model=llm_client.answer_model,
+        )
+        if answer:
+            return answer
+        return self._fallback_answer(question, rag_docs, category)
 
+    async def generate_all_answers(
+        self,
+        original_question: str,
+        similar_questions: list[str],
+        rag_docs: list[dict[str, Any]],
+        category: str = "",
+    ) -> tuple[str, list[str]]:
+        all_questions = [original_question] + similar_questions
+        tasks = [self._generate_single_answer(q, rag_docs, category=category) for q in all_questions]
+        results = await asyncio.gather(*tasks)
+        return results[0], list(results[1:])
+
+    def _fallback_answer(self, question: str, rag_docs: list[dict[str, Any]], category: str = "") -> str:
+        if not rag_docs:
+            return "현재 질문과 직접 연결되는 근거 문서를 찾지 못했습니다. 사실관계가 더 필요하므로 발생 시점, 장소/관계, 구체적 행위, 증거 유무를 알려주세요."
+        summary = self._summarize_context(question, category)
         snippets = self._relevant_snippets(question, rag_docs, category, limit=3)
         basis = "\n".join(f"- {snippet}" for snippet in snippets) if snippets else "- 검색된 문서에서 직접 관련 근거를 충분히 추리지 못했습니다."
-
         return (
             "1) 상황 정리\n"
-            f"{facts}\n\n"
-            "2) 관련 법률 쟁점\n"
-            f"{issue}\n\n"
-            "3) 근거에서 확인한 내용\n"
+            f"{summary}\n\n"
+            "2) 근거에서 확인한 내용\n"
             f"{basis}\n\n"
-            "4) 지금 할 일\n"
-            f"- {evidence}\n"
-            f"- {actions}\n"
-            f"- {risk}\n\n"
-            "5) 주의사항\n"
-            "이 답변은 입력한 사실관계와 검색 근거에 따른 일반 안내입니다. 실제 청구 가능성, 신고 전략, 소멸시효·고소기간 등은 "
-            "구체 자료를 본 뒤 달라질 수 있습니다."
+            "3) 지금 할 일\n"
+            "- 증거와 사실관계를 먼저 정리하세요.\n"
+            "- 긴급 위험이나 기한이 있으면 공공기관 또는 상담기관에 먼저 연결하세요.\n\n"
+            "4) 주의사항\n"
+            "이 답변은 입력한 사실관계와 검색 근거에 따른 일반 안내입니다."
         )
 
-    def _classify(self, text: str) -> str:
-        if any(
-            term in text
-            for term in [
-                "성폭력",
-                "성추행",
-                "성희롱",
-                "강제추행",
-                "강간",
-                "불법촬영",
-                "스토킹",
-                "동의 없이",
-                "동의없이",
-                "몸을 만",
-                "허리를 만",
-                "가슴",
-                "엉덩이",
-                "거절했는데",
-            ]
-        ):
-            return "성폭력"
-        if any(term in text for term in ["임금", "월급", "알바", "아르바이트", "근로", "해고", "퇴직금", "최저임금"]):
-            return "노동"
-        return "일반"
-
-    def _summarize_user_facts(self, question: str, category: str) -> str:
-        pieces = []
+    def _summarize_context(self, question: str, category: str) -> str:
         if category == "노동":
-            if any(term in question for term in ["임금", "월급", "알바비", "급여"]):
-                pieces.append("임금 또는 급여 미지급 문제가 핵심으로 보입니다")
-            if "근로계약서" in question and any(term in question for term in ["없", "안", "미작성"]):
-                pieces.append("근로계약서 미작성/미교부 가능성이 있습니다")
-            if any(term in question for term in ["카톡", "문자", "대화", "녹음"]):
-                pieces.append("대화 기록 등 증거가 일부 있는 것으로 보입니다")
-        elif category == "성폭력":
-            if any(term in question for term in ["성추행", "강제추행", "만졌", "접촉"]):
-                pieces.append("동의 없는 신체접촉 여부가 핵심으로 보입니다")
-            if any(term in question for term in ["카톡", "문자", "녹음", "사진", "목격"]):
-                pieces.append("사후 대화나 기록 등 증거가 일부 있는 것으로 보입니다")
-
-        if not pieces:
-            return "말씀하신 내용은 법률 검토가 필요한 사안으로 보입니다."
-        return "말씀하신 내용을 기준으로 보면, " + ", ".join(pieces) + "."
-
-    def _issue_summary(self, category: str) -> str:
-        if category == "노동":
-            return (
-                "근로 제공 사실, 약정 임금, 실제 지급 여부, 근무시간, 근로계약서 작성 여부가 중요합니다. "
-                "근로계약서가 없어도 실제 사용자의 지휘·감독 아래 일했다면 임금청구와 임금체불 진정 가능성을 검토할 수 있습니다. "
-                "다만 체불액은 약속한 시급/월급, 실제 근무일·시간, 이미 받은 돈을 대조해서 산정해야 합니다."
-            )
+            return "임금, 근로계약, 근무시간, 지급 여부를 우선 확인해야 합니다."
         if category == "성폭력":
-            return (
-                "행위의 구체적 내용, 동의 여부, 관계와 장소, 반복성·강제성, 사건 직후 대화와 주변 진술이 중요합니다. "
-                "동의 없는 신체접촉은 구체적 행위와 정황에 따라 강제추행 등 형사 문제와 학교 내 신고/보호조치가 동시에 문제될 수 있습니다."
-            )
+            return "동의 여부, 구체적 행위, 장소, 관계, 사건 직후 증거가 중요합니다."
         return "사안의 법적 분류, 발생 시점, 상대방과의 관계, 증거 유무를 먼저 확인해야 합니다."
-
-    def _evidence_guidance(self, category: str) -> str:
-        if category == "노동":
-            return "카카오톡/문자, 출퇴근 기록, 근무표, 계좌내역, 급여 약속 내용, 사업장 정보, 함께 일한 사람의 진술을 모아 체불액 표를 만들어두세요."
-        if category == "성폭력":
-            return "카카오톡/문자, 통화·녹음, 사진, 진료기록, 목격자, 사건 직후 작성한 메모를 원본 상태로 보존하세요."
-        return "문자, 녹음, 계약서, 사진, 계좌내역처럼 사건을 뒷받침할 자료를 원본으로 보존하세요."
-
-    def _action_guidance(self, category: str) -> str:
-        if category == "노동":
-            return "임금체불은 고용노동부 진정, 학교 노동상담/법률상담, 대한법률구조공단 132 상담을 검토하세요."
-        if category == "성폭력":
-            return "긴급하면 112, 피해 상담은 여성긴급전화 1366, 학교 인권센터/상담센터, 대한법률구조공단 132 상담을 검토하세요."
-        return "학교 상담센터, 공공 상담기관, 대한법률구조공단 132 등에서 구체 자료를 바탕으로 상담을 받아보세요."
 
     def _relevant_snippets(self, question: str, rag_docs: list[dict[str, Any]], category: str, limit: int = 3) -> list[str]:
         query_terms = set(re.findall(r"[0-9A-Za-z가-힣]{2,}", question.lower()))
@@ -242,11 +244,54 @@ class ConsistencyChecker:
                 best_sentence = sentence
         return best_sentence
 
-    def _text_similarity(self, left: str, right: str) -> float:
-        return SequenceMatcher(None, self._normalize(left), self._normalize(right)).ratio()
+    def _embed_answers(self, answers: list[str]) -> np.ndarray:
+        embedder = self._load_embedder()
+        if embedder is None:
+            return np.zeros((len(answers), 1), dtype=float)
+        prefixed = ["passage: " + self._comparison_text(a or "") for a in answers]
+        embeddings = embedder.encode(
+            prefixed,
+            batch_size=8,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
+        return np.asarray(embeddings)
 
-    def _normalize(self, text: str) -> str:
-        return re.sub(r"\s+", " ", text).strip().lower()
+    def _cosine_similarity_scores(self, original_answer: str, similar_answers: list[str]) -> list[float]:
+        valid_answers = [a for a in similar_answers if isinstance(a, str) and a.strip()]
+        if not original_answer.strip() or not valid_answers:
+            return []
+        embedder = self._load_embedder()
+        if embedder is None:
+            normalized_original = self._comparison_text(original_answer)
+            return [float(SequenceMatcher(None, normalized_original, self._comparison_text(ans)).ratio()) for ans in valid_answers]
+        all_answers = [original_answer] + valid_answers
+        embeddings = self._embed_answers(all_answers)
+        original_emb = embeddings[0]
+        similar_embs = embeddings[1:]
+        scores = similar_embs @ original_emb
+        return [float(s) for s in scores]
+
+    def score_answers(self, original_answer: str, similar_answers: list[str]) -> tuple[bool, float, list[float]]:
+        scores = self._cosine_similarity_scores(original_answer, similar_answers)
+        if not scores:
+            return False, 0.0, []
+        top_k = max(3, len(scores) // 2)
+        robust_scores = sorted(scores, reverse=True)[:top_k]
+        median_score = float(statistics.median(robust_scores))
+        return median_score >= self.threshold, median_score, scores
+
+    async def run(self, question: str, rag_docs: list[dict[str, Any]] | None = None, legal_category: str = "") -> tuple[bool, str, float, list[str]]:
+        rag_docs = rag_docs or []
+        similar_questions = await self.generate_similar_questions(question)
+        original_answer, similar_answers = await self.generate_all_answers(
+            original_question=question,
+            similar_questions=similar_questions,
+            rag_docs=rag_docs,
+            category=legal_category,
+        )
+        is_reliable, score, _ = self.score_answers(original_answer, similar_answers)
+        return is_reliable, original_answer, score, similar_answers
 
 
 consistency_checker = ConsistencyChecker()

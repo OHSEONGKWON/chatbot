@@ -29,23 +29,34 @@ class RAGConfig:
 
 @dataclass
 class NERConfig:
-	model_path: str = os.getenv("LAWSGUARD_NER_MODEL", str(BASE_DIR / "outputs" / "legal-ner-lawsguard-v2-30k"))
-	use_model: bool = os.getenv("LAWSGUARD_USE_MODEL_NER", "1") == "1"
-	min_confidence: float = float(os.getenv("LAWSGUARD_NER_MIN_CONFIDENCE", "0.70"))
-	max_length: int = int(os.getenv("LAWSGUARD_NER_MAX_LENGTH", "510"))
+	model_id: str = field(default_factory=lambda: os.getenv("NER_MODEL_ID", "legal-ner-lawsguard-v2-30k"))
+	use_model: bool = field(default_factory=lambda: os.getenv("LAWSGUARD_USE_MODEL_NER", "1") == "1")
+	min_confidence: float = field(default_factory=lambda: float(os.getenv("LAWSGUARD_NER_MIN_CONFIDENCE", "0.70")))
+	max_length: int = field(default_factory=lambda: int(os.getenv("LAWSGUARD_NER_MAX_LENGTH", "510")))
+	model_path: str = field(default="", init=False)
+	
+	def __post_init__(self):
+		# NER_MODEL_ID가 절대 경로면 그대로 사용, 아니면 outputs 폴더 내에서 찾기
+		if os.path.isabs(self.model_id):
+			self.model_path = self.model_id
+		elif self.model_id.startswith(("outputs/", "outputs\\")):
+			self.model_path = str(BASE_DIR / self.model_id)
+		else:
+			# 기본값: ID를 outputs 폴더 내 경로로 해석
+			self.model_path = str(BASE_DIR / "outputs" / self.model_id)
 
 
 @dataclass
 class ClarificationConfig:
 	max_retries: int = 5
-	min_score_threshold: float = 3.0
+	min_score_threshold: float = float(os.getenv("CLARIFICATION_MIN_SCORE", os.getenv("LAWSGUARD_CLARIFICATION_MIN_SCORE", "3.5")))
 	fallback_message: str = "대답에 필요한 정보가 충분하지 않아 일반적인 기준으로 대답하겠습니다."
 
 
 @dataclass
 class HallucinationConfig:
 	num_similar_questions: int = 10
-	consistency_threshold: float = 0.60
+	consistency_threshold: float = float(os.getenv("CONSISTENCY_THRESHOLD", os.getenv("LAWSGUARD_CONSISTENCY_THRESHOLD", "0.75")))
 	similarity_weight_nli: float = 0.6
 	similarity_weight_embed: float = 0.4
 	nli_model: str = "klue/roberta-large"
@@ -56,8 +67,10 @@ class HallucinationConfig:
 
 @dataclass
 class LLMConfig:
-	provider: str = os.getenv("LAWSGUARD_LLM_PROVIDER", "openai")
-	model_name: str = os.getenv("LAWSGUARD_OPENAI_MODEL", "gpt-4o-mini")
+	provider: str = os.getenv("LAWSGUARD_LLM_PROVIDER", os.getenv("LLM_PROVIDER", "openai"))
+	model_name: str = os.getenv("LAWSGUARD_OPENAI_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
+	clarify_model_name: str = os.getenv("CLARIFY_MODEL_ID", model_name)
+	answer_model_name: str = os.getenv("ANSWER_MODEL_ID", model_name)
 	api_base: Optional[str] = os.getenv("OPENAI_BASE_URL") or None
 	api_key: Optional[str] = os.getenv("OPENAI_API_KEY") or None
 	temperature: float = float(os.getenv("LAWSGUARD_LLM_TEMPERATURE", "0.2"))

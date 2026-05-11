@@ -51,6 +51,18 @@ class LawsGuardPipeline:
 
         return "조금 더 구체적으로 알려주실 수 있나요?"
 
+    def _has_sufficient_detail_for_override(self, clarify_result: ClarificationResult, avg_score: float) -> bool:
+        eval_result = clarify_result.eval
+        if eval_result is None or clarify_result.legal_category == "불명확":
+            return False
+
+        entity_check = eval_result.entity_check or {}
+        filled_count = sum(1 for value in entity_check.values() if value)
+        if eval_result.score < 3.5 or filled_count < 3:
+            return False
+
+        return avg_score >= max(0.40, self._cfg.hallucination.consistency_threshold - 0.35)
+
     async def process(self, user_id: str, user_input: str) -> PipelineResult:
         session = session_store.get(user_id)
         if session is None:
@@ -82,32 +94,34 @@ class LawsGuardPipeline:
             legal_category=legal_category,
         )
         if not is_reliable:
-            session.retry_count += 1
-            # Use dynamic requery generation (avoid fixed sexual-case templates)
-            try:
-                eval_obj = clarify_result.eval
-                missing = eval_obj.missing_elements if eval_obj else []
-                entity_check = eval_obj.entity_check if eval_obj else None
-                requery_message = await self._clarify.generate_requery(
-                    question=final_question,
-                    missing=missing,
-                    retry_count=session.retry_count,
-                    entity_check=entity_check,
-                    context=session.accumulated_context,
-                    session=session,
-                )
-            except Exception:
-                # fallback to previous heuristic builder
-                requery_message = self._build_consistency_requery(final_question, legal_category, avg_score)
+            if not self._has_sufficient_detail_for_override(clarify_result, avg_score):
+                session.retry_count += 1
+                # Use dynamic requery generation (avoid fixed sexual-case templates)
+                try:
+                    eval_obj = clarify_result.eval
+                    missing = eval_obj.missing_elements if eval_obj else []
+                    entity_check = eval_obj.entity_check if eval_obj else None
+                    requery_message = await self._clarify.generate_requery(
+                        question=final_question,
+                        missing=missing,
+                        retry_count=session.retry_count,
+                        entity_check=entity_check,
+                        context=session.accumulated_context,
+                        session=session,
+                        legal_category=legal_category,
+                    )
+                except Exception:
+                    # fallback to previous heuristic builder
+                    requery_message = self._build_consistency_requery(final_question, legal_category, avg_score)
 
-            return PipelineResult(
-                response_text=requery_message,
-                needs_requery=True,
-                session_ended=False,
-                consistency_score=avg_score,
-                legal_category=legal_category,
-                step_reached=4,
-            )
+                return PipelineResult(
+                    response_text=requery_message,
+                    needs_requery=True,
+                    session_ended=False,
+                    consistency_score=avg_score,
+                    legal_category=legal_category,
+                    step_reached=4,
+                )
 
         legal_reasoning_result = await self._legal_reasoning.validate(
             question=final_question,

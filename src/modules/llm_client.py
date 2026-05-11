@@ -14,6 +14,14 @@ class LLMClient:
     def available(self) -> bool:
         return bool(config.llm.api_key)
 
+    @property
+    def clarify_model(self) -> str:
+        return getattr(config.llm, "clarify_model_name", None) or config.llm.model_name
+
+    @property
+    def answer_model(self) -> str:
+        return getattr(config.llm, "answer_model_name", None) or config.llm.model_name
+
     def _get_client(self):
         if self._client is not None:
             return self._client
@@ -30,10 +38,26 @@ class LLMClient:
             self._client = None
         return self._client
 
-    async def complete(self, prompt: str, system: Optional[str] = None, max_tokens: Optional[int] = None) -> str:
+    async def complete(
+        self,
+        prompt: Optional[str] = None,
+        system: Optional[str] = None,
+        max_tokens: Optional[int] = None,
+        *,
+        system_prompt: Optional[str] = None,
+        user_prompt: Optional[str] = None,
+        temperature: Optional[float] = None,
+        json_mode: bool = False,
+        model: Optional[str] = None,
+    ) -> str:
         client = self._get_client()
         if client is None:
             return ""
+
+        if prompt is None:
+            prompt = user_prompt or ""
+        if system is None:
+            system = system_prompt
 
         messages = []
         if system:
@@ -41,14 +65,29 @@ class LLMClient:
         messages.append({"role": "user", "content": prompt})
 
         try:
-            response = await client.chat.completions.create(
-                model=config.llm.model_name,
-                messages=messages,
-                temperature=config.llm.temperature,
-                max_tokens=max_tokens or config.llm.max_tokens,
-            )
+            request_kwargs = {
+                "model": model or config.llm.model_name,
+                "messages": messages,
+                "temperature": config.llm.temperature if temperature is None else temperature,
+                "max_tokens": max_tokens or config.llm.max_tokens,
+            }
+            if json_mode:
+                request_kwargs["response_format"] = {"type": "json_object"}
+            response = await client.chat.completions.create(**request_kwargs)
             return (response.choices[0].message.content or "").strip()
         except Exception:
+            if json_mode:
+                try:
+                    request_kwargs = {
+                        "model": model or config.llm.model_name,
+                        "messages": messages,
+                        "temperature": config.llm.temperature if temperature is None else temperature,
+                        "max_tokens": max_tokens or config.llm.max_tokens,
+                    }
+                    response = await client.chat.completions.create(**request_kwargs)
+                    return (response.choices[0].message.content or "").strip()
+                except Exception:
+                    return ""
             return ""
 
     async def complete_many(self, prompts: list[str], system: Optional[str] = None) -> list[str]:

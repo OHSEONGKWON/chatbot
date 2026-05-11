@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter
+from collections import OrderedDict
 import json
 import math
 import re
@@ -97,16 +98,39 @@ class LegalRetriever:
         self._bm25_index: list[tuple[RAGDocument, list[str], Counter]] | None = None
         self._doc_freq: Counter | None = None
         self._avg_doc_len = 0.0
+        self._query_cache: OrderedDict[tuple[str, int, str], list[dict[str, Any]]] = OrderedDict()
+        self._query_cache_size = 64
 
     async def retrieve_async(self, query: str, top_k: int | None = None, legal_category: str = "") -> list[dict[str, Any]]:
         return await asyncio.to_thread(self.retrieve, query, top_k, legal_category)
 
     def retrieve(self, query: str, top_k: int | None = None, legal_category: str = "") -> list[dict[str, Any]]:
         top_k = top_k or config.rag.top_k
+        cache_key = (re.sub(r"\s+", " ", (query or "")).strip().lower(), top_k, legal_category or "")
+        cached = self._query_cache.get(cache_key)
+        if cached is not None:
+            self._query_cache.move_to_end(cache_key)
+            return [doc.copy() for doc in cached]
+
         docs = self._retrieve_from_chroma(query, top_k)
         if not docs:
             docs = self._retrieve_from_jsonl(query, top_k, legal_category=legal_category)
-        return [doc.__dict__ for doc in self._dedupe_docs(docs)[:top_k]]
+        result = []
+        for doc in self._dedupe_docs(docs)[:top_k]:
+            payload = doc.__dict__.copy()
+            payload.setdefault("content", payload.get("text", ""))
+            result.append(payload)
+        self._query_cache[cache_key] = [doc.copy() for doc in result]
+        self._query_cache.move_to_end(cache_key)
+        while len(self._query_cache) > self._query_cache_size:
+            self._query_cache.popitem(last=False)
+        return result
+
+    async def warmup(self):
+        await asyncio.to_thread(self._ensure_bm25_index)
+        await asyncio.to_thread(self._load_jsonl_cache)
+        if config.rag.enable_vector:
+            await asyncio.to_thread(self._embed_query, "법률 상담")
 
     def _retrieve_from_chroma(self, query: str, top_k: int) -> list[RAGDocument]:
         if not config.rag.enable_vector:
@@ -120,24 +144,31 @@ class LegalRetriever:
 
             embedding = self._embed_query(query)
             if embedding is None:
-                return []
-
-            result = self._collection.query(
-                query_embeddings=[embedding],
-                n_results=top_k,
-                include=["documents", "metadatas", "distances"],
-            )
+                result = self._collection.query(
+                    query_texts=[query],
+                    n_results=top_k,
+                    include=["documents", "metadatas", "distances"],
+                )
+            else:
+                result = self._collection.query(
+                    query_embeddings=[embedding],
+                    n_results=top_k,
+                    include=["documents", "metadatas", "distances"],
+                )
             docs = []
             ids = result.get("ids", [[]])[0]
             texts = result.get("documents", [[]])[0]
             metadatas = result.get("metadatas", [[]])[0]
             distances = result.get("distances", [[]])[0]
             for idx, text in enumerate(texts):
+                metadata = metadatas[idx] or {}
+                if self._has_suspect_statute_metadata(metadata):
+                    continue
                 distance = float(distances[idx]) if idx < len(distances) else 0.0
                 docs.append(
                     RAGDocument(
                         text=text or "",
-                        metadata=metadatas[idx] or {},
+                        metadata=metadata,
                         chunk_id=ids[idx] if idx < len(ids) else "",
                         score=1.0 / (1.0 + max(distance, 0.0)),
                     )
@@ -151,7 +182,10 @@ class LegalRetriever:
             from sentence_transformers import SentenceTransformer
 
             if self._embedder is None:
-                self._embedder = SentenceTransformer(config.rag.embedding_model, local_files_only=True)
+                try:
+                    self._embedder = SentenceTransformer(config.rag.embedding_model, local_files_only=True)
+                except Exception:
+                    self._embedder = SentenceTransformer(config.rag.embedding_model)
             embedding = self._embedder.encode([query], normalize_embeddings=True, show_progress_bar=False)[0]
             return [float(x) for x in embedding]
         except Exception:
@@ -195,6 +229,8 @@ class LegalRetriever:
 
         scored = []
         for doc, doc_tokens, token_counts in self._bm25_index or []:
+            if self._has_suspect_statute_metadata(doc.metadata):
+                continue
             haystack = f"{doc.text} {json.dumps(doc.metadata, ensure_ascii=False)}"
             bm25 = self._bm25_score(query_tokens, doc_tokens, token_counts)
             if bm25 <= 0:
@@ -431,6 +467,15 @@ class LegalRetriever:
 
     def _source_type(self, doc: RAGDocument) -> str:
         return str((doc.metadata or {}).get("source_type") or "case")
+
+    def _has_suspect_statute_metadata(self, metadata: dict[str, Any]) -> bool:
+        law_name = re.sub(r"\s+", "", str((metadata or {}).get("law_name") or ""))
+        article_id = str((metadata or {}).get("article_id") or "")
+        if "성폭력범죄의처벌등에관한특례법" in law_name:
+            match = re.search(r"제(\d+)조", article_id)
+            if match and 297 <= int(match.group(1)) <= 305:
+                return True
+        return False
 
     def _dedupe_docs(self, docs: list[RAGDocument]) -> list[RAGDocument]:
         deduped = []

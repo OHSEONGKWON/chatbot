@@ -8,7 +8,8 @@ async def test_pipeline_requeries_sparse_labor_question():
     result = await pipeline.process("pytest-sparse", "알바비를 못 받았어요")
 
     assert result.needs_requery is True
-    assert "근무 조건" in result.response_text
+    assert "알려" in result.response_text
+    assert result.legal_category == "노동"
 
 
 @pytest.mark.asyncio
