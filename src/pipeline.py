@@ -58,7 +58,8 @@ class LawsGuardPipeline:
 
         entity_check = eval_result.entity_check or {}
         filled_count = sum(1 for value in entity_check.values() if value)
-        if eval_result.score < 3.5 or filled_count < 3:
+        min_filled = 2 if clarify_result.legal_category == "성폭력" else 3
+        if eval_result.score < 3.5 or filled_count < min_filled:
             return False
 
         return avg_score >= max(0.40, self._cfg.hallucination.consistency_threshold - 0.35)

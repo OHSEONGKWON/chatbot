@@ -85,6 +85,7 @@ class KakaoConfig:
 	callback_message: str = "법률 자문을 준비 중이에요 ⚖️\n잠시만 기다려 주세요..."
 	server_host: str = "0.0.0.0"
 	server_port: int = 8000
+	server_url: str = field(default_factory=lambda: os.getenv("SERVER_URL", "http://localhost:8000"))
 
 
 @dataclass

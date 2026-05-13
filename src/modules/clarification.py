@@ -40,9 +40,11 @@ EVAL_USER_TEMPLATE = """다음 사용자 질문을 분석하세요.
 4. missing_elements: 부족한 정보를 한국어로 구체적으로 기술 (배열, 없으면 빈 배열)
 
 5. can_proceed:
-   - 일반 사안: score >= 3.5이고 legal_category != "불명확"이면 true
+   - 일반 사안: score >= 3.0이고 legal_category != "불명확"이면 true
+   - 성폭력/강간/성추행/강제추행: 행위(무슨 일이 있었는지)와 주체(가해자 또는 관계)가 확인되면 timing 없어도 true
    - 언어적 성희롱/교육기관 성희롱: 주체, 행위, 원하는 판단 또는 조치가 있으면 timing이 없어도 true 가능
    - 임금체불: 미지급 임금, 상대방, 받고 싶은 목적이 있으면 timing이 없어도 true 가능
+   - 심각한 피해 사안(강간, 성폭행, 성추행, 불법촬영)은 핵심 사실만 있어도 가능한 한 true로 판단하세요.
    - '어떻게 해야 하나요?', '~인가요?', '신고할 수 있나요?', '처벌되나요?', '받을 수 있나요?' 같은 표현은 purpose=true로 보세요.
 
 응답 JSON 형식:
@@ -131,6 +133,16 @@ class ClarificationManager:
         )
         data = _safe_json_loads(raw)
         if not data:
+            # 파인튜닝 모델 실패 시 기본 모델로 재시도
+            raw = await llm_client.complete(
+                system_prompt=EVAL_SYSTEM,
+                user_prompt=prompt,
+                temperature=0.0,
+                json_mode=True,
+                model="gpt-4o-mini",
+            )
+            data = _safe_json_loads(raw)
+        if not data:
             return self._heuristic_eval(context or question)
 
         result = EvalResult(
@@ -192,7 +204,11 @@ class ClarificationManager:
             entity_check=repaired_entity,
         )
         repaired.missing_elements = self._missing_from_entity_check(repaired_entity)
-        repaired.can_proceed = not self._should_requery(repaired, context=context)
+        # LLM이 진행 가능하다고 판단하면 그대로 신뢰. 키워드 휴리스틱은 LLM이 불확실할 때만 보조.
+        if result.can_proceed:
+            repaired.can_proceed = True
+        else:
+            repaired.can_proceed = not self._should_requery(repaired, context=context)
         return repaired
 
     def _missing_from_entity_check(self, entity_check: dict) -> list[str]:
@@ -207,7 +223,7 @@ class ClarificationManager:
     def _category_from_issue(self, issue: str) -> str:
         if issue in {"임금체불", "부당해고"}:
             return "노동"
-        if issue in {"교육기관 언어적 성희롱", "언어적 성희롱", "신체접촉형 강제추행", "불법촬영"}:
+        if issue in {"교육기관 언어적 성희롱", "언어적 성희롱", "신체접촉형 강제추행", "불법촬영", "강간"}:
             return "성폭력"
         return "불명확"
 
@@ -225,6 +241,9 @@ class ClarificationManager:
 
     def _infer_issue(self, text: str, legal_category: str = "") -> str:
         t = text or ""
+        if _contains_any(t, ("강간", "성폭행", "강제성교", "성적 피해", "성범죄")):
+            return "강간"
+
         if _contains_any(t, ("교수", "선생님", "교사", "수업", "강의", "학생", "학교", "대학")) and _contains_any(
             t, ("성희롱", "성적 발언", "여자답", "남자답", "가슴이 커야", "가슴이 작", "다리가 굵", "치마", "몸매", "외모")
         ):
@@ -254,17 +273,17 @@ class ClarificationManager:
     def _has_context_signal(self, context: str, topic: str) -> bool:
         ctx = context or ""
         if topic == "subject":
-            return _contains_any(ctx, ("나", "저는", "제가", "저에게", "본인", "교수", "선생님", "사장", "점장", "회사", "상사", "동료", "엄마", "아빠", "상대방"))
+            return _contains_any(ctx, ("나", "저는", "제가", "저에게", "본인", "교수", "선생님", "사장", "점장", "회사", "상사", "동료", "엄마", "아빠", "상대방", "선배", "후배", "친구", "남자친구", "여자친구", "지인", "연인", "파트너", "이웃", "모르는", "아는 사람", "남성", "여성", "남자", "여자", "오빠", "형", "언니", "누나", "아저씨", "직장상사", "직장 상사"))
         if topic == "timing":
             return bool(re.search(r"\b\d{4}[-./]\d{1,2}[-./]\d{1,2}\b", ctx)) or _contains_any(
                 ctx, ("어제", "오늘", "그제", "지난", "방금", "전", "개월", "년", "월", "일", "시", "분", "경", "수업 중", "회식")
             )
         if topic == "action":
-            return _contains_any(ctx, ("추행", "성희롱", "발언", "말했", "만졌", "해고", "그만 나오", "나오지 말", "임금", "월급", "급여", "알바비", "못 받", "미지급", "일했", "근무", "근로계약서", "촬영", "몰카", "찍힌", "찍혔", "유포", "괴롭힘"))
+            return _contains_any(ctx, ("추행", "성희롱", "발언", "말했", "만졌", "해고", "그만 나오", "나오지 말", "임금", "월급", "급여", "알바비", "못 받", "미지급", "일했", "근무", "근로계약서", "촬영", "몰카", "찍힌", "찍혔", "유포", "괴롭힘", "강간", "성폭행", "성폭력", "강제성교", "성적 피해", "성범죄", "협박", "동영상"))
         if topic == "purpose":
             return _contains_any(ctx, ("고소", "신고", "진정", "합의", "반환", "손해배상", "처벌", "상담", "성립", "받고", "알고 싶", "구제", "어떻게 해야", "어떻게 하나", "어떡", "가능", "할 수 있", "인가요", "되나요", "되나요?", "해야 하나요"))
         if topic == "evidence":
-            return _contains_any(ctx, ("증거", "녹음", "문자", "카톡", "목격자", "CCTV", "출근기록", "계좌", "급여명세서"))
+            return _contains_any(ctx.lower(), ("증거", "녹음", "문자", "카톡", "목격자", "cctv", "출근기록", "계좌", "급여명세서", "영상", "사진", "목격", "블랙박스", "녹화"))
         return False
 
     def _topic_from_missing_text(self, text: str) -> str:
@@ -299,6 +318,8 @@ class ClarificationManager:
             priority = ("purpose", "evidence", "action", "subject", "timing")
         elif issue == "신체접촉형 강제추행":
             priority = ("purpose", "evidence", "timing", "action", "subject")
+        elif issue == "강간":
+            priority = ("subject", "evidence", "timing", "purpose")
         else:
             priority = ("subject", "action", "purpose", "timing", "evidence")
 
@@ -453,6 +474,7 @@ class ClarificationManager:
             ctx,
             (
                 "가슴", "엉덩이", "허벅지", "만졌", "성추행", "강제추행",
+                "강간", "성폭행", "성폭력", "강제성교", "성적 피해", "성범죄",
                 "몰카", "불법촬영", "도촬", "찍힌", "찍혔", "촬영당", "몰래 찍",
                 "유포", "협박", "통매음", "성기 사진", "음란 메시지",
                 "스토킹", "계속 연락", "계속 따라",
@@ -499,9 +521,13 @@ class ClarificationManager:
             # 모두 있으면 재질문 안 함
             return False
 
+        # 강간: 주체 + 행위만 있으면 진행
+        if issue == "강간":
+            has_subject = entity_check.get("subject") or self._has_context_signal(context, "subject")
+            return not (has_action and has_subject)
+
         # 다른 강제추행/성범죄: 기본 기준
         if issue in (
-            "강간",
             "준강간",
             "준강제추행",
             "불법촬영",
@@ -629,7 +655,7 @@ class ClarificationManager:
                 eval=eval_result,
             )
 
-        if self._should_requery(eval_result, context=context):
+        if not eval_result.can_proceed:
             session.retry_count += 1
             requery_message = await self.generate_requery(
                 question=session.original_question,

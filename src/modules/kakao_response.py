@@ -42,6 +42,25 @@ def quick_reply(label: str, message_text: str) -> dict:
     return {"label": label, "action": "message", "messageText": message_text}
 
 
+def build_image_response(image_url: str, alt_text: str = "4컷 법률 만화") -> dict:
+    return {
+        "version": "2.0",
+        "template": {
+            "outputs": [{"simpleImage": {"imageUrl": image_url, "altText": alt_text}}]
+        },
+    }
+
+
+def build_text_and_image_response(text: str, image_url: str, quick_replies: list[dict] | None = None) -> dict:
+    chunks = split_for_kakao(text)
+    outputs = [{"simpleText": {"text": chunk}} for chunk in chunks]
+    outputs.append({"simpleImage": {"imageUrl": image_url, "altText": "4컷 법률 만화"}})
+    template = {"outputs": outputs}
+    if quick_replies:
+        template["quickReplies"] = quick_replies[:10]
+    return {"version": "2.0", "template": template}
+
+
 def split_for_kakao(text: str) -> list[str]:
     clean = re.sub(r"\n{3,}", "\n\n", (text or "").strip())
     if not clean:
