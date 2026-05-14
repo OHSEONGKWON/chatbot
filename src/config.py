@@ -86,6 +86,8 @@ class KakaoConfig:
 	server_host: str = "0.0.0.0"
 	server_port: int = 8000
 	server_url: str = field(default_factory=lambda: os.getenv("SERVER_URL", "http://localhost:8000"))
+	rest_api_key: str = field(default_factory=lambda: os.getenv("KAKAO_REST_API_KEY", ""))
+	bot_id: str = field(default_factory=lambda: os.getenv("KAKAO_BOT_ID", "69c3fb758094aa665fd2c5f3"))
 
 
 @dataclass

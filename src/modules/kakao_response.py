@@ -52,7 +52,8 @@ def build_image_response(image_url: str, alt_text: str = "4컷 법률 만화") -
 
 
 def build_text_and_image_response(text: str, image_url: str, quick_replies: list[dict] | None = None) -> dict:
-    chunks = split_for_kakao(text)
+    # Kakao template outputs are limited; keep room for one image block.
+    chunks = split_for_kakao(text)[: max(1, MAX_OUTPUTS - 1)]
     outputs = [{"simpleText": {"text": chunk}} for chunk in chunks]
     outputs.append({"simpleImage": {"imageUrl": image_url, "altText": "4컷 법률 만화"}})
     template = {"outputs": outputs}
