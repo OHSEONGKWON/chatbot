@@ -131,7 +131,14 @@ class LawsGuardPipeline:
             legal_category=legal_category,
         )
 
-        ner_result = await self._ner.check_and_correct(answer=legal_reasoning_result.validated_answer, rag_docs=rag_docs)
+        route = getattr(clarify_result, "route", None)
+        route_issue = getattr(route, "issue", None) if route is not None else None
+        ner_result = await self._ner.check_and_correct(
+            answer=legal_reasoning_result.validated_answer,
+            rag_docs=rag_docs,
+            route=route,
+            route_issue=route_issue,
+        )
         corrected_answer = ner_result.corrected_answer
 
         final_response = await self._formatter.format(

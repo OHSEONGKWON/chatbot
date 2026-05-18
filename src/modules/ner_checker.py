@@ -41,6 +41,67 @@ except Exception:
     config = _C()
 
 
+CASE_NUMBER_PATTERN = r"\b\d{4}[가-힣]{1,3}\d{1,6}\b"
+# Civil cases: 가합(합의부), 가접(접수), 가단(단독), 가초(항소) 등
+CASE_NUMBER_CIVIL_PATTERN = r"\b\d{4}(?:가합|가단|가초|가접|가상)\d{1,6}\b"
+# Criminal cases: 고합(합의부), 고단(단독), 고초(항소), 고접(접수) 등
+CASE_NUMBER_CRIMINAL_PATTERN = r"\b\d{4}(?:고합|고단|고초|고접|고상)\d{1,6}\b"
+# Precedent/판례: 다, 나 등의 정정 판례 표기
+CASE_NUMBER_PRECEDENT_PATTERN = r"\b(?:대판|대법원판례|판례)\s*\d{4}\s*다\d{4,5}\b|\b\d{4}\s*나\d{4,5}\b"
+
+PHONE_PATTERN = r"\b(?:112|1366|1350|1331|132|1588-0075|\d{2,3}-\d{3,4}-\d{4})\b"
+
+KNOWN_CONTACTS = {
+    "경찰청": ["112"],
+    "여성긴급전화": ["1366"],
+    "고용노동부": ["1350"],
+    "국가인권위원회": ["1331"],
+    "대한법률구조공단": ["132"],
+}
+
+ISSUE_REGISTRY = {
+    "wage_unpaid": {
+        "allowed_laws": ["근로기준법", "임금채권보장법", "근로자퇴직급여 보장법", "고용보험법"],
+        "forbidden_laws": ["형법", "형법 제298조", "민법", "성폭력범죄의 처벌 등에 관한 특례법"],
+    },
+    "dismissal": {
+        "allowed_laws": ["근로기준법", "근로자참여 및 협력증진에 관한 법률"],
+        "forbidden_laws": ["형법", "형법 제298조", "민법", "성폭력범죄의 처벌 등에 관한 특례법"],
+    },
+    "sexual_harassment": {
+        "allowed_laws": ["양성평등기본법", "남녀고용평등법", "성폭력범죄의 처벌 등에 관한 특례법"],
+        "forbidden_laws": ["근로기준법", "임금채권보장법", "근로자퇴직급여 보장법", "민법"],
+    },
+    "indecent_assault": {
+        "allowed_laws": ["형법", "형법 제298조", "성폭력범죄의 처벌 등에 관한 특례법"],
+        "forbidden_laws": ["근로기준법", "임금채권보장법", "근로자퇴직급여 보장법", "민법"],
+    },
+    "illegal_filming": {
+        "allowed_laws": ["성폭력범죄의 처벌 등에 관한 특례법", "형법"],
+        "forbidden_laws": ["근로기준법", "임금채권보장법", "근로자퇴직급여 보장법", "민법"],
+    },
+    "강간": {
+        "allowed_laws": ["형법", "성폭력범죄의 처벌 등에 관한 특례법"],
+        "forbidden_laws": ["근로기준법", "임금채권보장법", "근로자퇴직급여 보장법", "민법"],
+    },
+}
+
+ISSUE_ALIASES = {
+    "임금체불": "wage_unpaid",
+    "부당해고": "dismissal",
+    "교육기관 언어적 성희롱": "sexual_harassment",
+    "언어적 성희롱": "sexual_harassment",
+    "신체접촉형 강제추행": "indecent_assault",
+    "강간": "강간",
+    "불법촬영": "illegal_filming",
+    "wage_unpaid": "wage_unpaid",
+    "dismissal": "dismissal",
+    "sexual_harassment": "sexual_harassment",
+    "indecent_assault": "indecent_assault",
+    "illegal_filming": "illegal_filming",
+}
+
+
 @dataclass
 class NERCheckResult:
     original_answer: str
@@ -48,6 +109,11 @@ class NERCheckResult:
     found_entities: list
     mismatched_entities: list[dict]
     was_corrected: bool
+    mid_confidence_warnings: list[dict] = None
+
+    def __post_init__(self):
+        if self.mid_confidence_warnings is None:
+            self.mid_confidence_warnings = []
 
     @property
     def hallucinations(self):
@@ -60,7 +126,7 @@ class NERFactChecker:
     Constructor avoids heavy model loading so the module can be imported in tests quickly.
     """
     def __init__(self, model_path=None):
-        self.target_labels = ['LAW', 'PENALTY', 'AMOUNT', 'DATE', 'ORG', 'CRIME']
+        self.target_labels = ['LAW', 'PENALTY', 'AMOUNT', 'DATE', 'ORG', 'CRIME', 'CASE_NUMBER', 'PHONE']
         self.model_path = model_path or getattr(getattr(config, "ner", None), "model_path", None)
         self.use_model = bool(getattr(getattr(config, "ner", None), "use_model", True))
         self.min_model_confidence = float(getattr(getattr(config, "ner", None), "min_confidence", 0.70))
@@ -112,8 +178,8 @@ class NERFactChecker:
         self._ner_model = None
         self._ner_tokenizer = None
 
-    async def check_and_correct(self, answer, rag_docs):
-        return await asyncio.to_thread(self.check_and_correct_sync, answer, rag_docs)
+    async def check_and_correct(self, answer, rag_docs, route=None, route_issue=None):
+        return await asyncio.to_thread(self.check_and_correct_sync, answer, rag_docs, route, route_issue)
 
     async def check(self, answer, rag_docs):
         return await self.check_and_correct(answer, rag_docs)
@@ -122,9 +188,21 @@ class NERFactChecker:
         await asyncio.to_thread(self._load_ner_model)
         await asyncio.to_thread(self._load_semantic_embedder)
 
-    def check_and_correct_sync(self, answer, rag_docs):
+    def check_and_correct_sync(self, answer, rag_docs, route=None, route_issue=None):
         found_entities = self.extract_entities(answer)
-        mismatches = self.find_hallucinations(answer, rag_docs, found_entities=found_entities)
+        all_hallucinations = self.find_hallucinations(answer, rag_docs, found_entities=found_entities, route=route, route_issue=route_issue)
+        
+        # 신뢰도에 따라 hallucinations와 mid_confidence_warnings로 분리
+        mismatches = []
+        mid_confidence_warnings = []
+        
+        for hallucination in all_hallucinations:
+            confidence = hallucination.get("confidence", 0.0)
+            if 0.80 <= confidence < 0.95:
+                mid_confidence_warnings.append(hallucination)
+            else:
+                mismatches.append(hallucination)
+        
         corrected = self._corrector.fix_answer(answer, mismatches)
         return NERCheckResult(
             original_answer=answer,
@@ -132,6 +210,7 @@ class NERFactChecker:
             found_entities=found_entities,
             mismatched_entities=mismatches,
             was_corrected=corrected != answer,
+            mid_confidence_warnings=mid_confidence_warnings,
         )
 
     def extract_entities(self, text):
@@ -280,7 +359,7 @@ class NERFactChecker:
                 r"시급\s*\d[\d,]*",
             ],
             "ORG": [
-                r"(?:고용노동부|경찰|검찰청|대법원|법률구조공단|여성긴급전화|학교|대학교)",
+                r"(?:고용노동부|국가인권위원회|경찰청|경찰|검찰청|대법원|대한법률구조공단|법률구조공단|여성긴급전화|학교|대학교)",
             ],
             "CRIME": [
                 r"(?:강제추행|성추행|성폭력|성희롱|강간|불법촬영|스토킹|폭행|협박)",
@@ -288,6 +367,12 @@ class NERFactChecker:
             "PENALTY": [
                 r"\d+\s*년\s*(?:이하|이상)의?\s*징역",
                 r"\d[\d,]*\s*만원\s*(?:이하|이상)의?\s*벌금",
+            ],
+            "CASE_NUMBER": [
+                CASE_NUMBER_PATTERN,
+            ],
+            "PHONE": [
+                PHONE_PATTERN,
             ],
         }
         for label, regexes in patterns.items():
@@ -298,16 +383,18 @@ class NERFactChecker:
                     if not word or key in seen:
                         continue
                     seen.add(key)
-                    entities.append(
-                        {
-                            "entity_group": label,
-                            "label": label,
-                            "word": word,
-                            "start": match.start(),
-                            "end": match.end(),
-                            "score": 1.0,
-                        }
-                    )
+                    entity_dict = {
+                        "entity_group": label,
+                        "label": label,
+                        "word": word,
+                        "start": match.start(),
+                        "end": match.end(),
+                        "score": 1.0,
+                    }
+                    # CASE_NUMBER의 경우 타입 메타데이터 추가
+                    if label == "CASE_NUMBER":
+                        entity_dict["case_type"] = self._categorize_case_number(word)
+                    entities.append(entity_dict)
         entities.sort(key=lambda item: item["start"])
         return entities
 
@@ -343,18 +430,28 @@ class NERFactChecker:
             deduped.append(entity)
         return deduped
 
-    def find_hallucinations(self, answer, rag_docs, found_entities=None):
+    def find_hallucinations(self, answer, rag_docs, found_entities=None, route=None, route_issue=None):
         found_entities = found_entities if found_entities is not None else self.extract_entities(answer)
         candidates_by_label, context_law = self._collect_candidates(rag_docs)
         hallucinations = []
 
+        # Route-aware checks can flag unsupported legal domains even if RAG is sparse.
+        route_issue_key = self._resolve_route_issue(route, route_issue)
+        rag_sparsity = len(candidates_by_label.get("LAW", [])) < 2  # RAG 자료 부족 여부
+
         for entity in found_entities:
             label = entity.get("entity_group") or entity.get("label")
             word = entity.get("word")
-            if label not in {"LAW", "PENALTY", "AMOUNT", "DATE", "CRIME"} or not word:
+            if label not in {"LAW", "PENALTY", "AMOUNT", "DATE", "CRIME", "CASE_NUMBER", "PHONE", "ORG"} or not word:
                 continue
             candidates = candidates_by_label.get(label, [])
             if not candidates:
+                # LAW/ORG는 candidates가 없어도 route 기반 검사는 수행
+                # CRIME/PENALTY/ORG는 RAG가 너무 부족할 때 정규 검사 스킵 (fallback은 뒤에서 처리)
+                if label not in {"LAW", "ORG", "CRIME", "PENALTY"}:
+                    continue
+                # Route 검사를 거친 후 route에서도 지지되지 않으면 다음 엔티티로
+                # This will be handled by _route_issue_hallucinations
                 continue
             match = self._match_entity_against_candidates(label, word, candidates, context_law=context_law)
             if match.get("is_supported"):
@@ -381,9 +478,16 @@ class NERFactChecker:
                     "match_score": float(match.get("score", 0.0)),
                     "risk_level": risk_level,
                     "reason_code": match.get("method", "unsupported_entity"),
+                    "action": self._choose_action(label, risk_level, match, candidate),
                     "reason": "답변의 개체명이 검색 근거 문서에서 충분히 지지되지 않습니다.",
                 }
             )
+
+        hallucinations.extend(self._route_issue_hallucinations(answer, found_entities, candidates_by_label, context_law, route_issue_key))
+        hallucinations.extend(self._known_contact_hallucinations(found_entities))
+        # RAG 자료가 부족할 때 CRIME/PENALTY/ORG fallback 처리
+        if rag_sparsity:
+            hallucinations.extend(self._crime_penalty_fallback_hallucinations(found_entities, answer))
         return hallucinations
 
     def _collect_candidates(self, rag_docs):
@@ -442,15 +546,40 @@ class NERFactChecker:
         t = re.sub(r'\s+', ' ', t).strip()
 
         law_abbreviations = {
+            # 근로 관련
             "근기": "근로기준법",
             "근기법": "근로기준법",
             "근로": "근로기준법",
+            "최저임금": "최저임금법",
+            "최저임금법": "최저임금법",
+            # 남녀고용평등
+            "남고평": "남녀고용평등과일가정양립지원에관한법률",
+            "남녀고용": "남녀고용평등과일가정양립지원에관한법률",
+            "고용평등법": "남녀고용평등과일가정양립지원에관한법률",
+            "양성평등": "양성평등기본법",
+            "양평기본법": "양성평등기본법",
+            # 산업안전
             "산안": "산업안전보건법",
             "산안법": "산업안전보건법",
+            # 산재보험
+            "산재법": "산업재해보상보험법",
+            "산재보험": "산업재해보상보험법",
+            # 퇴직급여
+            "퇴직금법": "근로자퇴직급여보장법",
+            "퇴직급여": "근로자퇴직급여보장법",
+            # 성폭력
             "성폭": "성폭력범죄의처벌등에관한특례법",
             "성폭법": "성폭력범죄의처벌등에관한특례법",
             "성폭력처벌법": "성폭력범죄의처벌등에관한특례법",
             "성폭력특례법": "성폭력범죄의처벌등에관한특례법",
+            # 스토킹
+            "스토킹법": "스토킹범죄의처벌등에관한법률",
+            "스토킹범죄처벌": "스토킹범죄의처벌등에관한법률",
+            # 기타
+            "고용보험법": "고용보험법",
+            "임금채권보장": "임금채권보장법",
+            "형법": "형법",
+            "민법": "민법",
         }
         compact = re.sub(r"[\s·ㆍ,.\-()「」『』<>\[\]]+", "", t)
         if compact in law_abbreviations:
@@ -461,6 +590,19 @@ class NERFactChecker:
             compact = compact.replace(alias, canonical)
         return compact
 
+    def _same_law_family(self, law1_text, law2_text):
+        """약칭·약자 변형을 고려하여 두 법률명이 같은 법인지 판단합니다."""
+        if not law1_text or not law2_text:
+            return False
+        norm1 = self._normalize_law_text(str(law1_text))
+        norm2 = self._normalize_law_text(str(law2_text))
+        if norm1 == norm2:
+            return True
+        # 둘 다 공백을 제거한 형태로 비교
+        compact1 = re.sub(r"[\s·ㆍ,.\-()「」『』<>\[\]]+", "", norm1)
+        compact2 = re.sub(r"[\s·ㆍ,.\-()「」『』<>\[\]]+", "", norm2)
+        return compact1 == compact2
+
     def _law_article_key(self, text):
         compact = self._normalize_law_text(text)
         match = re.search(r"제\d+조(?:제\d+항)?(?:제\d+호)?", compact)
@@ -470,6 +612,23 @@ class NERFactChecker:
         compact = self._normalize_law_text(text)
         return re.sub(r"제\d+조(?:제\d+항)?(?:제\d+호)?", "", compact)
 
+    def _categorize_case_number(self, case_number_text):
+        """사건번호의 유형을 판단합니다: civil, criminal, precedent"""
+        if not case_number_text:
+            return "unknown"
+        text = case_number_text.strip()
+        # 판례 패턴 먼저 확인
+        if re.search(CASE_NUMBER_PRECEDENT_PATTERN, text):
+            return "precedent"
+        # 형사 패턴
+        if re.search(CASE_NUMBER_CRIMINAL_PATTERN, text):
+            return "criminal"
+        # 민사 패턴
+        if re.search(CASE_NUMBER_CIVIL_PATTERN, text):
+            return "civil"
+        # 기본 패턴으로는 분류할 수 없으면 unknown 반환
+        return "unknown"
+
     def _normalize_entity_text(self, text, label=None):
         if not isinstance(text, str):
             return ""
@@ -478,6 +637,12 @@ class NERFactChecker:
 
         if label == "LAW":
             return self._normalize_law_text(t)
+
+        if label == "CASE_NUMBER":
+            return re.sub(r"\s+", "", t)
+
+        if label == "PHONE":
+            return re.sub(r"\s+", "", t)
 
         if label == "DATE":
             nums = re.findall(r"\d+", t)
@@ -557,7 +722,7 @@ class NERFactChecker:
             return {"is_supported": False, "candidate": None, "method": "empty", "score": 0.0, "confidence": 0.0, "combo_score": 1.0}
 
         # Strict numeric/date handling
-        if label in {"DATE", "AMOUNT"}:
+        if label in {"DATE", "AMOUNT", "CASE_NUMBER", "PHONE"}:
             for cand in candidates:
                 norm_cand = self._normalize_entity_text(cand, label)
                 if norm_cand and norm_word == norm_cand:
@@ -644,15 +809,68 @@ class NERFactChecker:
         return best
 
     def _replacement_confidence(self, label, word, candidate, match):
+        """환각 수정의 신뢰도를 계산합니다. 라벨과 점수에 따라 차별화된 값을 반환합니다."""
         method = match.get("method")
         score = float(match.get("score", 0.0))
-        if label == "LAW" and method == "same_law_article_mismatch":
-            word_law = self._law_name_key(word)
-            cand_law = self._law_name_key(candidate)
-            if word_law and word_law == cand_law and self._law_article_key(word) and self._law_article_key(candidate):
+        confidence = float(match.get("confidence", 0.0))
+        
+        # LAW: 법령 이름이나 조문이 일치하는 경우
+        if label == "LAW":
+            if method == "exact":
+                return 0.99
+            if method == "same_law_article_mismatch":
+                word_law = self._law_name_key(word)
+                cand_law = self._law_name_key(candidate)
+                if word_law and word_law == cand_law and self._law_article_key(word) and self._law_article_key(candidate):
+                    return 0.98
+            if method == "law_name_only" and score >= 0.88:
+                return 0.92
+            if method == "fuzzy" and score >= 0.95:
+                return 0.88
+            if confidence >= 0.90:  # combo_score 반영
+                return 0.85
+        
+        # DATE/AMOUNT: 정확 매칭만 가능하므로 높은 신뢰도
+        if label == "DATE":
+            if method == "exact":
+                return 0.99
+        if label == "AMOUNT":
+            if method == "exact":
                 return 0.98
-        if label in {"CRIME", "PENALTY"} and method in {"fuzzy", "semantic"} and score >= 0.96:
-            return 0.90
+        
+        # ORG: 조직명 유사도 높으면 교체 가능
+        if label == "ORG":
+            if method == "exact":
+                return 0.99
+            if method == "fuzzy" and score >= 0.95:
+                return 0.93
+            if method == "fuzzy" and score >= 0.90:
+                return 0.85
+            if confidence >= 0.85:
+                return 0.80
+        
+        # CRIME/PENALTY: 시맨틱 또는 퍼지 매칭으로 높은 점수
+        if label in {"CRIME", "PENALTY"}:
+            if method == "exact":
+                return 0.99
+            if method == "semantic" and score >= 0.95:
+                return 0.94
+            if method == "fuzzy" and score >= 0.96:
+                return 0.91
+            if method == "fuzzy" and score >= 0.92:
+                return 0.86
+            if confidence >= 0.88:  # combo_score 반영된 신뢰도
+                return 0.82
+        
+        # CASE_NUMBER/PHONE: 정확 매칭만 지원
+        if label in {"CASE_NUMBER", "PHONE"}:
+            if method == "exact":
+                return 0.99
+        
+        # 폴백: 높은 지지도면 약간의 수정 신뢰도 부여
+        if confidence >= 0.85:
+            return 0.75
+        
         return 0.0
 
     def _risk_level(self, label, support_score, match):
@@ -663,6 +881,207 @@ class NERFactChecker:
         if support_score < 0.75:
             return "medium"
         return "low"
+
+    def _resolve_route_issue(self, route=None, route_issue=None):
+        issue = route_issue
+        if issue is None and route is not None:
+            if isinstance(route, dict):
+                issue = route.get("issue")
+            else:
+                issue = getattr(route, "issue", None)
+        if not issue:
+            return ""
+        return ISSUE_ALIASES.get(str(issue).strip(), str(issue).strip())
+
+    def _issue_registry_for(self, route_issue):
+        if not route_issue:
+            return None
+        return ISSUE_REGISTRY.get(route_issue)
+
+    def _text_contains_term(self, text, term):
+        compact = re.sub(r"\s+", "", (text or "").lower())
+        candidate = re.sub(r"\s+", "", (term or "").lower())
+        return bool(candidate) and candidate in compact
+
+    def _route_issue_hallucinations(self, answer, found_entities, candidates_by_label, context_law, route_issue_key):
+        registry = self._issue_registry_for(route_issue_key)
+        if not registry:
+            return []
+
+        hallucinations = []
+        allowed_laws = registry.get("allowed_laws", [])
+        forbidden_laws = registry.get("forbidden_laws", [])
+        law_entities = [entity for entity in found_entities if (entity.get("entity_group") or entity.get("label")) == "LAW"]
+        law_candidates = candidates_by_label.get("LAW", [])
+        
+        # RAG candidates가 부족할 때의 fallback 임계값
+        candidate_scarcity_threshold = 2
+
+        for entity in law_entities:
+            word = entity.get("word") or ""
+            if not word:
+                continue
+            # forbidden_laws: 약칭·약자도 고려한 검사
+            if any(self._same_law_family(word, term) for term in forbidden_laws):
+                hallucinations.append(
+                    {
+                        "label": "LAW",
+                        "wrong_word": word,
+                        "correct_word": allowed_laws[0] if len(allowed_laws) == 1 else "",
+                        "start": entity.get("start"),
+                        "end": entity.get("end"),
+                        "confidence": 0.99,
+                        "support_score": 0.0,
+                        "match_score": 0.0,
+                        "risk_level": "high",
+                        "reason_code": "forbidden_law",
+                        "action": "remove_sentence" if not allowed_laws else "soften",
+                        "reason": f"{route_issue_key} 사안과 맞지 않는 법률이 답변에 포함되어 있습니다.",
+                    }
+                )
+                continue
+
+            # allowed_laws가 존재하고 법률이 allowed_laws 범위를 벗어나는 경우
+            # RAG candidates가 부족할 때 더 강한 검사 수행
+            is_in_allowed = any(self._same_law_family(word, term) for term in allowed_laws) if allowed_laws else True
+            is_rag_sparse = len(law_candidates) < candidate_scarcity_threshold
+            
+            if allowed_laws and not is_in_allowed:
+                hallucinations.append(
+                    {
+                        "label": "LAW",
+                        "wrong_word": word,
+                        "correct_word": allowed_laws[0],
+                        "start": entity.get("start"),
+                        "end": entity.get("end"),
+                        "confidence": 0.98 if is_rag_sparse else 0.96,  # RAG가 부족하면 신뢰도 상향
+                        "support_score": 0.0,
+                        "match_score": 0.0,
+                        "risk_level": "high",
+                        "reason_code": "route_domain_mismatch",
+                        "action": "remove_sentence",
+                        "reason": f"{route_issue_key} 사안에서 허용된 법률 범위를 벗어나는 서술입니다.",
+                    }
+                )
+
+        return self._dedupe_hallucinations(hallucinations)
+
+    def _known_contact_hallucinations(self, found_entities):
+        org_entities = [entity for entity in found_entities if (entity.get("entity_group") or entity.get("label")) == "ORG" and entity.get("word")]
+        phone_entities = [entity for entity in found_entities if (entity.get("entity_group") or entity.get("label")) == "PHONE" and entity.get("word")]
+        if not org_entities or not phone_entities:
+            return []
+
+        hallucinations = []
+        for org in org_entities:
+            org_word = str(org.get("word") or "")
+            org_key = self._match_known_contact_org(org_word)
+            if not org_key:
+                continue
+            expected_phones = KNOWN_CONTACTS.get(org_key, [])
+            for phone in phone_entities:
+                phone_word = str(phone.get("word") or "")
+                phone_norm = self._normalize_entity_text(phone_word, "PHONE")
+                if not phone_norm or phone_norm in expected_phones:
+                    continue
+                hallucinations.append(
+                    {
+                        "label": "PHONE",
+                        "wrong_word": phone_word,
+                        "correct_word": expected_phones[0] if len(expected_phones) == 1 else "",
+                        "start": phone.get("start"),
+                        "end": phone.get("end"),
+                        "confidence": 0.97,
+                        "support_score": 0.0,
+                        "match_score": 0.0,
+                        "risk_level": "high",
+                        "reason_code": "known_contact_mismatch",
+                        "action": "replace" if len(expected_phones) == 1 else "remove_sentence",
+                        "reason": f"{org_key}에 연결된 전화번호가 답변에서 잘못 매핑되었습니다.",
+                    }
+                )
+                break
+
+        return self._dedupe_hallucinations(hallucinations)
+
+    def _crime_penalty_fallback_hallucinations(self, found_entities, answer):
+        """RAG 자료가 부족할 때 CRIME/PENALTY 엔티티 검증 (휴리스틱 기반)"""
+        hallucinations = []
+        
+        # RAG가 없을 때만 fallback 처리
+        crime_entities = [entity for entity in found_entities if (entity.get("entity_group") or entity.get("label")) == "CRIME" and entity.get("word")]
+        penalty_entities = [entity for entity in found_entities if (entity.get("entity_group") or entity.get("label")) == "PENALTY" and entity.get("word")]
+        
+        # 범죄와 형벌의 연관성 검증 (같은 문장에 있으면 연관성 높음)
+        for crime_entity in crime_entities:
+            crime_word = crime_entity.get("word", "")
+            crime_start = crime_entity.get("start", 0)
+            crime_end = crime_entity.get("end", 0)
+            
+            # 같은 문장 내 penalty와 연관성 확인
+            same_sentence_penalties = []
+            for penalty_entity in penalty_entities:
+                penalty_start = penalty_entity.get("start", 0)
+                penalty_end = penalty_entity.get("end", 0)
+                
+                # 같은 문장인지 확인 (. ! ? \n으로 구분)
+                crime_sentence_start = max(0, answer.rfind("\n", 0, crime_start))
+                crime_sentence_end = answer.find("\n", crime_end)
+                if crime_sentence_end == -1:
+                    crime_sentence_end = answer.find(".", crime_end)
+                if crime_sentence_end == -1:
+                    crime_sentence_end = len(answer)
+                
+                if crime_sentence_start <= penalty_start < crime_sentence_end and \
+                   crime_sentence_start <= penalty_end <= crime_sentence_end:
+                    same_sentence_penalties.append(penalty_entity)
+            
+            # CRIME 엔티티가 있지만 같은 문장에 PENALTY가 없으면 경고 (낮은 신뢰도)
+            if crime_entities and not same_sentence_penalties:
+                hallucinations.append({
+                    "label": "CRIME",
+                    "wrong_word": crime_word,
+                    "correct_word": "",
+                    "start": crime_entity.get("start"),
+                    "end": crime_entity.get("end"),
+                    "confidence": 0.65,  # 낮은 신뢰도
+                    "support_score": 0.0,
+                    "match_score": 0.0,
+                    "risk_level": "medium",
+                    "reason_code": "sparse_rag_crime_unverified",
+                    "action": "log_only",
+                    "reason": "범죄 행위가 검색 근거에서 충분히 확인되지 않았습니다.",
+                })
+        
+        return self._dedupe_hallucinations(hallucinations)
+
+    def _match_known_contact_org(self, word):
+        compact = self._normalize_entity_text(word, "ORG")
+        for org in KNOWN_CONTACTS:
+            if self._normalize_entity_text(org, "ORG") in compact or compact in self._normalize_entity_text(org, "ORG"):
+                return org
+        return ""
+
+    def _choose_action(self, label, risk_level, match, candidate):
+        method = match.get("method")
+        if label == "LAW" and risk_level == "high" and method in {"same_law_article_mismatch", "law_name_only"}:
+            return "soften"
+        if label in {"LAW", "ORG", "PHONE", "CASE_NUMBER", "DATE", "AMOUNT"} and candidate:
+            return "replace"
+        if risk_level == "high":
+            return "remove_sentence"
+        return "log_only"
+
+    def _dedupe_hallucinations(self, hallucinations):
+        deduped = []
+        seen = set()
+        for item in hallucinations:
+            key = (item.get("label"), item.get("start"), item.get("end"), item.get("wrong_word"), item.get("reason_code"))
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item)
+        return deduped
 
     def debug_match_entity(self, label, word, candidates, context_law=None):
         return self._match_entity_against_candidates(label=label, word=word, candidates=candidates, context_law=context_law)

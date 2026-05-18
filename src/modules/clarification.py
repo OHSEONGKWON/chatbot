@@ -204,11 +204,8 @@ class ClarificationManager:
             entity_check=repaired_entity,
         )
         repaired.missing_elements = self._missing_from_entity_check(repaired_entity)
-        # LLM이 진행 가능하다고 판단하면 그대로 신뢰. 키워드 휴리스틱은 LLM이 불확실할 때만 보조.
-        if result.can_proceed:
-            repaired.can_proceed = True
-        else:
-            repaired.can_proceed = not self._should_requery(repaired, context=context)
+        # 최종 진행 가능 여부는 휴리스틱 기준을 우선한다. LLM이 과하게 낙관적인 경우를 막기 위함이다.
+        repaired.can_proceed = not self._should_requery(heuristic, context=context)
         return repaired
 
     def _missing_from_entity_check(self, entity_check: dict) -> list[str]:
