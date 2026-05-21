@@ -318,15 +318,15 @@
       "support": 300
     },
     "NER 단독 (우리 모델)": {
-      "accuracy": 0.58,
-      "precision": 0.6875,
-      "recall": 0.2933,
-      "f1": 0.4112,
-      "auc_roc": 0.571,
-      "tp": 44,
-      "fp": 20,
-      "tn": 130,
-      "fn": 106,
+      "accuracy": 0.7167,
+      "precision": 0.8218,
+      "recall": 0.5533,
+      "f1": 0.6614,
+      "auc_roc": 0.715,
+      "tp": 83,
+      "fp": 18,
+      "tn": 132,
+      "fn": 67,
       "support": 300
     },
     "3계층 앙상블 (우리 시스템)": {
@@ -339,6 +339,42 @@
       "fp": 11,
       "tn": 139,
       "fn": 143,
+      "support": 300
+    },
+    "KoELECTRA-naver (외부 NER)": {
+      "accuracy": 0.73,
+      "precision": 0.6906,
+      "recall": 0.8333,
+      "f1": 0.7553,
+      "auc_roc": 0.6887,
+      "tp": 125,
+      "fp": 56,
+      "tn": 94,
+      "fn": 25,
+      "support": 300
+    },
+    "KoELECTRA-modu (외부 NER)": {
+      "accuracy": 0.5,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "auc_roc": 0.5,
+      "tp": 0,
+      "fp": 0,
+      "tn": 150,
+      "fn": 150,
+      "support": 300
+    },
+    "WikiNEural-Multilingual (외부 NER)": {
+      "accuracy": 0.5167,
+      "precision": 0.6667,
+      "recall": 0.0667,
+      "f1": 0.1212,
+      "auc_roc": 0.5162,
+      "tp": 10,
+      "fp": 5,
+      "tn": 145,
+      "fn": 140,
       "support": 300
     }
   }

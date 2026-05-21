@@ -49,8 +49,11 @@ Hybrid (KoSimCSE-RoBERTa) & 0.280 & 0.327 & 0.407 & 0.304 & 0.153 & 150 \\
 시스템 & Accuracy & Precision & Recall & F1 & AUC-ROC & N \\
 \midrule
 NLI 단독 (klue/roberta-large) & 0.500 & 0.000 & 0.000 & 0.000 & 0.500 & 300 \\
-NER 단독 (우리 모델) & 0.580 & 0.688 & 0.293 & 0.411 & 0.571 & 300 \\
+NER 단독 (우리 모델) & 0.717 & 0.822 & 0.553 & 0.661 & 0.715 & 300 \\
 3계층 앙상블 (우리 시스템) & 0.487 & 0.389 & 0.047 & 0.083 & 0.572 & 300 \\
+KoELECTRA-naver (외부 NER) & 0.730 & 0.691 & 0.833 & 0.755 & 0.689 & 300 \\
+KoELECTRA-modu (외부 NER) & 0.500 & 0.000 & 0.000 & 0.000 & 0.500 & 300 \\
+WikiNEural-Multilingual (외부 NER) & 0.517 & 0.667 & 0.067 & 0.121 & 0.516 & 300 \\
 \bottomrule
 \end{tabular}
 \end{table}
