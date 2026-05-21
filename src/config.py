@@ -29,7 +29,7 @@ class RAGConfig:
 
 @dataclass
 class NERConfig:
-	model_id: str = field(default_factory=lambda: os.getenv("NER_MODEL_ID", "legal-ner-lawsguard-v2-30k"))
+	model_id: str = field(default_factory=lambda: os.getenv("NER_MODEL_ID", "legal-ner-v3"))
 	use_model: bool = field(default_factory=lambda: os.getenv("LAWSGUARD_USE_MODEL_NER", "1") == "1")
 	min_confidence: float = field(default_factory=lambda: float(os.getenv("LAWSGUARD_NER_MIN_CONFIDENCE", "0.70")))
 	max_length: int = field(default_factory=lambda: int(os.getenv("LAWSGUARD_NER_MAX_LENGTH", "510")))

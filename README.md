@@ -124,7 +124,7 @@ LAWSGUARD_LLM_TIMEOUT=60
 LAWSGUARD_ENABLE_VECTOR_RAG=0
 
 # NER
-NER_MODEL_ID=legal-ner-lawsguard-v2-30k
+NER_MODEL_ID=legal-ner-v3
 LAWSGUARD_USE_MODEL_NER=1
 LAWSGUARD_NER_MIN_CONFIDENCE=0.70
 LAWSGUARD_NER_MAX_LENGTH=510
@@ -134,7 +134,7 @@ LAWSGUARD_CONSISTENCY_THRESHOLD=0.75
 LAWSGUARD_CLARIFICATION_MIN_SCORE=3.5
 ```
 
-`NER_MODEL_ID`는 절대경로, `outputs/...` 상대경로, 또는 `outputs/` 아래 모델 디렉터리명으로 사용할 수 있습니다. 기본값은 `outputs/legal-ner-lawsguard-v2-30k`입니다.
+`NER_MODEL_ID`는 절대경로, `outputs/...` 상대경로, 또는 `outputs/` 아래 모델 디렉터리명으로 사용할 수 있습니다. 기본값은 `outputs/legal-ner-v3`입니다.
 
 ### 3. 서버 실행
 
@@ -186,7 +186,7 @@ venv\Scripts\python.exe scripts\test_corrector.py
 
 - RAG JSONL 데이터: `data/real_data/New_Dataset/*.jsonl`
 - 선택적 ChromaDB 벡터 DB: `data/RAG_data/chroma_db/`
-- NER 학습 모델: `outputs/legal-ner-lawsguard-v2-30k/`
+- NER 학습 모델: `outputs/legal-ner-v3/`
 - NER 평가/학습 데이터: `data/real_bio_data/`, `data/hallucination_data/`, `data/mock_data/`
 
 기본 RAG는 JSONL 기반 검색으로 동작합니다. `LAWSGUARD_ENABLE_VECTOR_RAG=1`을 설정하면 ChromaDB와 임베딩 기반 검색을 먼저 시도하고, 실패 시 JSONL 검색으로 fallback합니다.
@@ -225,7 +225,7 @@ venv\Scripts\python.exe scripts\evaluate_ner_factcheck.py
 venv\Scripts\python.exe scripts\tune_ner_hybrid_thresholds.py
 
 # NER 모델 추가 학습
-venv\Scripts\python.exe scripts\train_legal_ner.py --base-model outputs\legal-ner-lawsguard-v2-30k --output-dir outputs\legal-ner-lawsguard-v3 --epochs 3 --batch-size 8
+venv\Scripts\python.exe scripts\train_legal_ner.py --base-model outputs\legal-ner-v3 --output-dir outputs\legal-ner-lawsguard-v3 --epochs 3 --batch-size 8
 ```
 
 ## 팀원 인수인계 요약

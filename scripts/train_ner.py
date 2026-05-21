@@ -399,7 +399,7 @@ def main():
 
     # 9. 기존 모델과 성능 비교
     print("\n=== 기존 모델 vs 새 모델 비교 ===")
-    old_metrics_path = REPO_ROOT / "outputs" / "legal-ner-lawsguard-v2-30k" / "metrics.json"
+    old_metrics_path = REPO_ROOT / "outputs" / "legal-ner-v3" / "metrics.json"
     if old_metrics_path.exists():
         with old_metrics_path.open(encoding="utf-8") as f:
             old = json.load(f)
