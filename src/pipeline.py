@@ -22,6 +22,7 @@ from .modules.ner_checker import ner_checker
 from .modules.rag import retriever
 from .session_store import session_store
 from .config import config
+from .evaluation import evaluate_pipeline_output, EvaluationResult
 
 
 @dataclass
@@ -41,6 +42,12 @@ class PipelineResult:
     original_consistency_answer: str = ""
     ner_mismatches: list[dict[str, Any]] | None = None
     ner_mid_confidence_warnings: list[dict[str, Any]] | None = None
+    # 4-지표 평가 결과 (step_reached=7인 정상 완료 응답에서만 산정)
+    sim_score: Optional[float] = None   # 유사성 지표
+    rag_score: Optional[float] = None   # RAG 품질 지표
+    ner_score: Optional[float] = None   # NER 지표
+    final_score: Optional[float] = None # 최종 지표
+    eval_detail: dict[str, Any] | None = None
 
 
 class LawsGuardPipeline:
@@ -257,6 +264,21 @@ class LawsGuardPipeline:
             rrs_report=rrs_report,
         )
 
+        eval_result: EvaluationResult = evaluate_pipeline_output(
+            raw_consistency_score=float(quality_report.get("raw_consistency_score") or 0.0),
+            sqqs_detail=quality_report.get("SQQS_detail") or {},
+            rrs_report=rrs_report,
+            found_entities=list(getattr(ner_result, "found_entities", None) or []),
+            mismatches=list(getattr(ner_result, "mismatched_entities", None) or []),
+            mid_confidence_warnings=list(getattr(ner_result, "mid_confidence_warnings", None) or []),
+        )
+        quality_report["EVALUATION"] = {
+            "sim": eval_result.sim_detail,
+            "rag": eval_result.rag_detail,
+            "ner": eval_result.ner_detail,
+            "final": eval_result.final_detail,
+        }
+
         session_store.delete(user_id)
         return PipelineResult(
             response_text=general_prefix + final_response,
@@ -274,6 +296,11 @@ class LawsGuardPipeline:
             original_consistency_answer=quality_report.get("original_answer", ""),
             ner_mismatches=getattr(ner_result, "mismatched_entities", None),
             ner_mid_confidence_warnings=getattr(ner_result, "mid_confidence_warnings", None),
+            sim_score=eval_result.sim_score,
+            rag_score=eval_result.rag_score,
+            ner_score=eval_result.ner_score,
+            final_score=eval_result.final_score,
+            eval_detail=quality_report["EVALUATION"],
         )
 
 
