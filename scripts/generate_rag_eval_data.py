@@ -1,46 +1,30 @@
 """
-RAG 평가 데이터 생성 스크립트
+RAG 평가 데이터 생성 (template-based, API 없음)
 
-data/external_processed/rag_chunks/rag_corpus.jsonl 에서
-OpenAI API를 사용하여 Query-Document 쌍을 자동 생성합니다.
-
-출력 형식:
-  {
-    "query_id": "...",
-    "query": "...",
-    "relevant_chunk_ids": ["chunk_id_1", ...],
-    "source_chunk_id": "chunk_id",     # 쿼리 생성 기반 청크
-    "difficulty": "easy|medium|hard"
-  }
+rag_corpus.jsonl에서 청크 샘플링 후 템플릿 기반 질문 생성.
 
 사용법:
   python scripts/generate_rag_eval_data.py
-  python scripts/generate_rag_eval_data.py --n-queries 100
+  python scripts/generate_rag_eval_data.py --n-queries 150
 """
-
 from __future__ import annotations
 
 import argparse
+import gc
 import io
 import json
 import random
 import re
 import sys
-import time
+from collections import defaultdict
+from pathlib import Path
 
 if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 if sys.stderr.encoding and sys.stderr.encoding.lower() not in ("utf-8", "utf8"):
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
-from pathlib import Path
-
-from dotenv import load_dotenv
-
-load_dotenv()
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-
-# 입력 데이터 경로 (우선순위 순)
 INPUT_PATHS = [
     REPO_ROOT / "data" / "external_processed" / "rag_chunks" / "rag_corpus.jsonl",
     REPO_ROOT / "data" / "real_data" / "New_Dataset" / "rag_law_chunks.jsonl",
@@ -49,177 +33,210 @@ INPUT_PATHS = [
 ]
 OUT_FILE = REPO_ROOT / "data" / "evaluation" / "rag_eval.jsonl"
 
-SYSTEM_PROMPT = """당신은 한국 법률 검색 시스템의 평가 데이터를 만드는 전문가입니다.
-주어진 법률 문서 청크를 읽고, 실제 사용자가 물어볼 법한 자연스러운 질문을 생성하세요.
+# ── 엔티티 추출 정규식 ────────────────────────────────────────────────────────
+LAW_ARTICLE_RE = re.compile(
+    r"([가-힣]{2,12}법(?:률|전)?)\s*(제\d+조(?:의\d+)?)", re.UNICODE
+)
+LAW_NAME_RE = re.compile(r"[가-힣]{2,12}법(?:률|전)?", re.UNICODE)
+ORG_RE = re.compile(
+    r"(?:대법원|헌법재판소|고등법원|지방법원|가정법원|행정법원|특허법원|"
+    r"대검찰청|검찰청|고용노동부|법무부|국토교통부|기획재정부|보건복지부|"
+    r"행정안전부|경찰청|국세청|공정거래위원회|금융감독원)",
+    re.UNICODE,
+)
+DATE_RE = re.compile(r"\d{4}년\s*\d{1,2}월|\d{4}\.\s*\d{1,2}\.\s*\d{1,2}\.", re.UNICODE)
+AMOUNT_RE = re.compile(r"\d+\s*(?:억|만)\s*원|\d{1,3}(?:,\d{3})+\s*원", re.UNICODE)
 
-규칙:
-1. 질문은 반드시 주어진 문서 내용에 대한 답을 찾을 수 있어야 합니다
-2. 질문은 한국어로, 실제 법률 상담 질문처럼 작성하세요
-3. 난이도별로 각 1개씩 총 3개 질문 생성:
-   - easy: 문서에서 직접 찾을 수 있는 사실 질문
-   - medium: 문서 내용을 이해해야 답할 수 있는 질문
-   - hard: 법률 지식과 문서 내용을 조합해야 하는 질문
+# ── 질문 템플릿 (type → [(difficulty, template), ...]) ───────────────────────
+TEMPLATES: dict[str, list[tuple[str, str]]] = {
+    "law_article": [
+        ("easy",   "{law}의 {article}에서 규정하는 내용은 무엇인가요?"),
+        ("medium", "{law}의 {article}에서 정한 요건을 충족하지 못하면 어떻게 되나요?"),
+        ("hard",   "{law}의 {article}을 위반했을 때 적용되는 법적 제재는 무엇인가요?"),
+    ],
+    "law_only": [
+        ("easy",   "{law}에서 규정하는 주요 내용은 무엇인가요?"),
+        ("medium", "{law}에서 정하는 의무 사항과 권리는 무엇인가요?"),
+        ("hard",   "{law}의 적용 범위와 예외 조항은 어떻게 되나요?"),
+    ],
+    "org": [
+        ("easy",   "{org}은 어떤 법적 역할을 담당하고 있나요?"),
+        ("medium", "{org}에서 처리하는 주요 법률 절차는 무엇인가요?"),
+        ("hard",   "{org}의 결정이나 처분에 불복하는 법적 절차는 어떻게 되나요?"),
+    ],
+    "date": [
+        ("easy",   "{date}에 적용되는 법률 규정은 무엇인가요?"),
+        ("medium", "{date}를 기준으로 발생하는 법적 효력은 무엇인가요?"),
+        ("hard",   "{date} 전후의 법률 적용 차이는 무엇인가요?"),
+    ],
+    "generic": [
+        ("easy",   "이 법률 조항에서 규정하는 핵심 내용은 무엇인가요?"),
+        ("medium", "이 규정의 적용 대상과 요건은 어떻게 되나요?"),
+        ("hard",   "이 규정과 관련된 법적 분쟁이 발생할 경우 어떻게 처리되나요?"),
+    ],
+}
 
-JSON 형식으로만 응답:
-{
-  "questions": [
-    {"difficulty": "easy", "query": "..."},
-    {"difficulty": "medium", "query": "..."},
-    {"difficulty": "hard", "query": "..."}
-  ]
-}"""
+
+def extract_entities(text: str) -> dict:
+    ent: dict = {}
+    m = LAW_ARTICLE_RE.search(text)
+    if m:
+        ent["law"] = m.group(1)
+        ent["article"] = m.group(2)
+        return ent
+    m = LAW_NAME_RE.search(text)
+    if m:
+        ent["law"] = m.group()
+        return ent
+    m = ORG_RE.search(text)
+    if m:
+        ent["org"] = m.group()
+        return ent
+    m = DATE_RE.search(text)
+    if m:
+        ent["date"] = m.group()
+    m = AMOUNT_RE.search(text)
+    if m:
+        ent["amount"] = m.group()
+    return ent
 
 
-def load_chunks(path: Path, max_chunks: int = 2000) -> list[dict]:
-    chunks = []
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            if line.strip():
-                rec = json.loads(line)
-                # chunk_id 필드 정규화
-                if "chunk_id" not in rec and "id" in rec:
-                    rec["chunk_id"] = rec["id"]
-                if "text" not in rec:
-                    continue
-                # 너무 짧은 청크 제외
-                if len(rec["text"]) < 100:
-                    continue
-                chunks.append(rec)
-                if len(chunks) >= max_chunks:
-                    break
+def generate_queries(text: str) -> list[tuple[str, str]]:
+    ent = extract_entities(text)
+    if "law" in ent and "article" in ent:
+        key = "law_article"
+    elif "law" in ent:
+        key = "law_only"
+    elif "org" in ent:
+        key = "org"
+    elif "date" in ent:
+        key = "date"
+    else:
+        key = "generic"
+
+    results: list[tuple[str, str]] = []
+    for difficulty, tmpl in TEMPLATES[key]:
+        try:
+            query = tmpl.format(**ent)
+        except KeyError:
+            # 키가 없으면 generic 대체
+            generic = TEMPLATES["generic"]
+            query = generic[len(results) % len(generic)][1]
+        results.append((difficulty, query))
+    return results
+
+
+def build_keyword_index(chunks: list[dict]) -> dict[str, list[str]]:
+    index: dict[str, list[str]] = defaultdict(list)
+    for chunk in chunks:
+        cid = chunk["chunk_id"]
+        text = chunk.get("text", "")
+        for m in LAW_ARTICLE_RE.finditer(text):
+            index[m.group(1) + "|" + m.group(2)].append(cid)
+        for m in LAW_NAME_RE.finditer(text):
+            index[m.group()].append(cid)
+    return dict(index)
+
+
+def find_relevant_chunks(query: str, source_id: str, index: dict, top_k: int = 3) -> list[str]:
+    scores: dict[str, int] = defaultdict(int)
+    for m in LAW_ARTICLE_RE.finditer(query):
+        for cid in index.get(m.group(1) + "|" + m.group(2), []):
+            if cid != source_id:
+                scores[cid] += 3
+    for m in LAW_NAME_RE.finditer(query):
+        for cid in index.get(m.group(), []):
+            if cid != source_id:
+                scores[cid] += 1
+    # 점수 있는 청크 전부 relevant로 포함 (최소 top_k개, 상한 없음)
+    extras = [cid for cid, _ in sorted(scores.items(), key=lambda x: -x[1])]
+    return [source_id] + extras
+
+
+def load_chunks(max_n: int = 5000) -> list[dict]:
+    chunks: list[dict] = []
+    for path in INPUT_PATHS:
+        if not path.exists():
+            continue
+        try:
+            with path.open(encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    text = rec.get("text", "")
+                    if len(text) < 100:
+                        continue
+                    chunks.append({
+                        "chunk_id": rec.get("chunk_id") or rec.get("id", ""),
+                        "text": text,
+                        "metadata": rec.get("metadata", {}),
+                    })
+                    if len(chunks) >= max_n:
+                        break
+        except Exception as e:
+            print(f"[WARN] 로드 실패: {path.name} - {e}", file=sys.stderr)
+        gc.collect()
+        if len(chunks) >= max_n:
+            break
     return chunks
 
 
-def call_openai_generate(client, chunk_text: str) -> list[dict]:
-    import openai
-
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": f"다음 법률 문서에 대한 질문을 생성하세요:\n\n{chunk_text[:800]}"},
-            ],
-            temperature=0.7,
-            max_tokens=600,
-            response_format={"type": "json_object"},
-        )
-        result = json.loads(response.choices[0].message.content)
-        return result.get("questions", [])
-    except Exception as e:
-        print(f"[WARN] OpenAI 호출 실패: {e}", file=sys.stderr)
-        return []
-
-
-def find_relevant_chunks(query: str, all_chunks: list[dict], source_id: str, top_k: int = 3) -> list[str]:
-    """키워드 기반으로 관련 청크 ID 찾기 (평가용 레이블)."""
-    # 소스 청크는 항상 포함
-    relevant = [source_id]
-
-    # 법령명/사건번호 추출
-    law_pattern = re.compile(r"[가-힣]+법(?:\s*제\d+조)?")
-    case_pattern = re.compile(r"\d{4}[가나다라마바사아자차카타파하도][가-힣\d]+\d+")
-
-    laws_in_query = set(law_pattern.findall(query))
-    cases_in_query = set(case_pattern.findall(query))
-
-    if not laws_in_query and not cases_in_query:
-        return relevant
-
-    for chunk in all_chunks:
-        if chunk.get("chunk_id", chunk.get("id")) == source_id:
-            continue
-        text = chunk.get("text", "")
-        score = 0
-        for law in laws_in_query:
-            if law in text:
-                score += 2
-        for case in cases_in_query:
-            if case in text:
-                score += 3
-        if score > 0:
-            relevant.append((score, chunk.get("chunk_id", chunk.get("id"))))
-
-    # 점수 기준 정렬 후 top_k
-    extra = sorted(
-        [(s, cid) for s, cid in relevant[1:] if isinstance(s, int)],
-        key=lambda x: -x[0],
-    )[:top_k - 1]
-
-    return [relevant[0]] + [cid for _, cid in extra]
-
-
 def main() -> None:
-    parser = argparse.ArgumentParser(description="RAG 평가용 Query-Document 쌍 생성")
-    parser.add_argument("--n-queries", type=int, default=100, help="생성할 총 쿼리 수 (기본 100)")
-    parser.add_argument("--input", type=Path, default=None, help="입력 JSONL 파일 (기본: 자동 선택)")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--n-queries", type=int, default=150)
     parser.add_argument("--output", type=Path, default=OUT_FILE)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--delay", type=float, default=0.5)
     args = parser.parse_args()
 
-    import openai
-
-    client = openai.OpenAI()
-
-    # 입력 파일 선택
-    input_path = args.input
-    if input_path is None:
-        for p in INPUT_PATHS:
-            if p.exists():
-                input_path = p
-                break
-    if input_path is None or not input_path.exists():
-        print(f"[ERROR] 입력 파일을 찾을 수 없습니다.", file=sys.stderr)
+    print("청크 로드 중...")
+    all_chunks = load_chunks()
+    print(f"로드된 청크: {len(all_chunks)}개")
+    if not all_chunks:
+        print("[ERROR] 청크 없음", file=sys.stderr)
         sys.exit(1)
 
-    print(f"입력 파일: {input_path}")
-    all_chunks = load_chunks(input_path)
-    print(f"로드된 청크: {len(all_chunks)}개")
+    print("키워드 인덱스 구축 중...", flush=True)
+    index = build_keyword_index(all_chunks)
+    print(f"인덱스 키워드: {len(index)}개")
 
-    random.seed(args.seed)
-    # 쿼리 당 3개 난이도 × n_queries / 3 ≈ 청크 수
-    n_source_chunks = max(1, args.n_queries // 3)
-    sample_chunks = random.sample(all_chunks, min(n_source_chunks, len(all_chunks)))
+    rng = random.Random(args.seed)
+    queries_per_chunk = 3
+    n_source = (args.n_queries + queries_per_chunk - 1) // queries_per_chunk
+    source_chunks = rng.sample(all_chunks, min(n_source, len(all_chunks)))
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     written = 0
-    query_id = 0
 
+    print(f"쿼리 생성 중 (목표: {args.n_queries}개)...", flush=True)
     with args.output.open("w", encoding="utf-8") as fout:
-        for i, chunk in enumerate(sample_chunks):
+        for i, chunk in enumerate(source_chunks):
             if written >= args.n_queries:
                 break
-
-            source_id = chunk.get("chunk_id", chunk.get("id", f"chunk_{i}"))
-            print(f"  [{written}/{args.n_queries}] {source_id[:40]}...")
-
-            questions = call_openai_generate(client, chunk["text"])
-            if not questions:
-                continue
-
-            for q in questions:
+            cid = chunk["chunk_id"]
+            for difficulty, query in generate_queries(chunk["text"]):
                 if written >= args.n_queries:
                     break
-                if not q.get("query"):
-                    continue
-
-                relevant_ids = find_relevant_chunks(q["query"], all_chunks, source_id)
-
-                record = {
-                    "query_id": f"rag_eval_{query_id:04d}",
-                    "query": q["query"],
-                    "relevant_chunk_ids": relevant_ids,
-                    "source_chunk_id": source_id,
-                    "difficulty": q.get("difficulty", "medium"),
+                relevant = find_relevant_chunks(query, cid, index)
+                fout.write(json.dumps({
+                    "query_id": f"rag_eval_{written:04d}",
+                    "query": query,
+                    "relevant_chunk_ids": relevant,
+                    "source_chunk_id": cid,
+                    "difficulty": difficulty,
                     "source_text_preview": chunk["text"][:200],
-                }
-                fout.write(json.dumps(record, ensure_ascii=False) + "\n")
+                }, ensure_ascii=False) + "\n")
+                fout.flush()
                 written += 1
-                query_id += 1
+            if i % 100 == 0:
+                gc.collect()
 
-            if args.delay > 0:
-                time.sleep(args.delay)
+    all_chunks = index = None
+    gc.collect()
 
     print(f"\n완료: {written}개 쿼리 → {args.output}")
     _print_stats(args.output)
@@ -227,18 +244,19 @@ def main() -> None:
 
 def _print_stats(path: Path) -> None:
     from collections import Counter
-
-    difficulty_counts: Counter = Counter()
-    with path.open("r", encoding="utf-8") as f:
+    diff_counts: Counter = Counter()
+    total = 0
+    with path.open(encoding="utf-8") as f:
         for line in f:
+            line = line.strip()
+            if not line:
+                continue
             rec = json.loads(line)
-            difficulty_counts[rec.get("difficulty", "unknown")] += 1
-
-    total = sum(difficulty_counts.values())
-    print(f"\n=== 데이터 통계 ===")
-    print(f"총 쿼리: {total}")
-    for d, c in sorted(difficulty_counts.items()):
-        print(f"  {d:8s}: {c:4d} ({c/total*100:.1f}%)")
+            total += 1
+            diff_counts[rec.get("difficulty", "unknown")] += 1
+    print(f"\n=== RAG 통계 ===\n총 쿼리: {total}")
+    for d, c in sorted(diff_counts.items()):
+        print(f"  {d:8s}: {c:4d}")
 
 
 if __name__ == "__main__":

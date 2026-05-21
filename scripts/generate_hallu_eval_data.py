@@ -1,334 +1,255 @@
 """
-환각 탐지 평가 데이터 생성 스크립트
+환각 탐지 평가 데이터 생성 (rule-based perturbation, API 없음)
 
-기존 hallucination_data/와 mock_data/에서 positive(환각)/negative(정상) 샘플을 구성하고,
-OpenAI API를 사용해 추가 환각 샘플을 생성합니다.
-
-출력 형식:
-  {
-    "eval_id": "...",
-    "answer": "...",         # 모델이 생성한 답변 (환각 포함 or 정상)
-    "rag_docs": [...],       # 검색된 RAG 문서들
-    "is_hallucination": true/false,
-    "hallucination_type": "law_name|article_num|date|amount|org|none",
-    "expected_mismatches": [{"label": ..., "wrong_word": ..., "correct_word": ...}]
-  }
+rag_corpus.jsonl에서 청크 샘플링:
+  - Positive (is_hallucination=True): 조문번호·금액·날짜·법령명 규칙 기반 변조
+  - Negative (is_hallucination=False): 원본 그대로
 
 사용법:
   python scripts/generate_hallu_eval_data.py
-  python scripts/generate_hallu_eval_data.py --n-positive 100 --n-negative 100
+  python scripts/generate_hallu_eval_data.py --n-positive 150 --n-negative 150
 """
-
 from __future__ import annotations
 
 import argparse
+import gc
 import io
 import json
 import random
+import re
 import sys
-import time
+from pathlib import Path
 
 if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 if sys.stderr.encoding and sys.stderr.encoding.lower() not in ("utf-8", "utf8"):
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
-from pathlib import Path
-
-from dotenv import load_dotenv
-
-load_dotenv()
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+CORPUS_PATHS = [
+    REPO_ROOT / "data" / "external_processed" / "rag_chunks" / "rag_corpus.jsonl",
+    REPO_ROOT / "data" / "real_data" / "New_Dataset" / "rag_law_chunks.jsonl",
+    REPO_ROOT / "data" / "real_data" / "New_Dataset" / "rag_case_chunks.jsonl",
+    REPO_ROOT / "data" / "real_data" / "New_Dataset" / "rag_manual_chunks.jsonl",
+]
 OUT_FILE = REPO_ROOT / "data" / "evaluation" / "hallu_eval.jsonl"
 
-# 기존 데이터 경로
-HALLU_DATA = {
-    "case_bio": REPO_ROOT / "data" / "hallucination_data" / "case_hallu_bio.jsonl",
-    "law_bio": REPO_ROOT / "data" / "hallucination_data" / "law_hallu_bio.jsonl",
-    "manual_bio": REPO_ROOT / "data" / "hallucination_data" / "manual_hallu_bio.jsonl",
-    "synthetic_bio": REPO_ROOT / "data" / "hallucination_data" / "synthetic_hallu_bio.jsonl",
-    "case_hallu": REPO_ROOT / "data" / "mock_data" / "case_hallu.jsonl",
-    "law_hallu": REPO_ROOT / "data" / "mock_data" / "law_hallu.jsonl",
-    "manual_hallu": REPO_ROOT / "data" / "mock_data" / "manual_hallu.jsonl",
-    "ner_factcheck": REPO_ROOT / "data" / "mock_data" / "ner_factcheck_eval.jsonl",
+# ── 변조용 정규식 ─────────────────────────────────────────────────────────────
+ARTICLE_RE = re.compile(r"제(\d+)조", re.UNICODE)
+AMOUNT_MAN_RE = re.compile(r"(\d+)\s*만\s*원", re.UNICODE)
+AMOUNT_EOK_RE = re.compile(r"(\d+)\s*억\s*원", re.UNICODE)
+DATE_FULL_RE = re.compile(r"(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})\.", re.UNICODE)
+DATE_YEAR_RE = re.compile(r"(\d{4})년", re.UNICODE)
+
+LAW_SUBSTITUTIONS: list[tuple[str, str]] = [
+    ("근로기준법", "노동기준법"),
+    ("형법", "특별형법"),
+    ("민법", "상법"),
+    ("상법", "민법"),
+    ("형사소송법", "민사소송법"),
+    ("민사소송법", "형사소송법"),
+    ("행정소송법", "행정심판법"),
+    ("국가공무원법", "지방공무원법"),
+    ("지방공무원법", "국가공무원법"),
+    ("개인정보보호법", "정보통신망법"),
+    ("도로교통법", "교통사고처리특례법"),
+    ("건축법", "국토계획법"),
+    ("약사법", "의료기기법"),
+    ("의료법", "보건의료기본법"),
+    ("저작권법", "특허법"),
+    ("특허법", "저작권법"),
+]
+
+
+# ── 변조 함수들 ───────────────────────────────────────────────────────────────
+
+def _perturb_article(text: str, rng: random.Random) -> tuple[str, dict | None]:
+    matches = list(ARTICLE_RE.finditer(text))
+    if not matches:
+        return text, None
+    m = rng.choice(matches)
+    orig = int(m.group(1))
+    candidates = [n for n in range(max(1, orig - 10), orig + 11) if n != orig]
+    if not candidates:
+        return text, None
+    new = rng.choice(candidates)
+    orig_str, new_str = f"제{orig}조", f"제{new}조"
+    return text.replace(orig_str, new_str, 1), {
+        "label": "LAW", "wrong_word": new_str, "correct_word": orig_str,
+    }
+
+
+def _perturb_amount(text: str, rng: random.Random) -> tuple[str, dict | None]:
+    for pat in (AMOUNT_MAN_RE, AMOUNT_EOK_RE):
+        matches = list(pat.finditer(text))
+        if not matches:
+            continue
+        m = rng.choice(matches)
+        orig_num = int(m.group(1))
+        factors = [0.5, 0.6, 0.7, 1.3, 1.5, 2.0]
+        new_num = max(1, int(orig_num * rng.choice(factors)))
+        while new_num == orig_num:
+            new_num = orig_num + rng.randint(10, 100)
+        unit = "만 원" if pat is AMOUNT_MAN_RE else "억 원"
+        orig_str = m.group(0)
+        new_str = f"{new_num}{unit}"
+        return text.replace(orig_str, new_str, 1), {
+            "label": "AMOUNT", "wrong_word": new_str, "correct_word": orig_str,
+        }
+    return text, None
+
+
+def _perturb_date(text: str, rng: random.Random) -> tuple[str, dict | None]:
+    m = DATE_FULL_RE.search(text)
+    if m:
+        year = int(m.group(1))
+        orig_str = m.group(0)
+        new_year = year + rng.choice([-2, -1, 1, 2])
+        new_str = f"{new_year}. {m.group(2)}. {m.group(3)}."
+        return text.replace(orig_str, new_str, 1), {
+            "label": "DATE", "wrong_word": new_str, "correct_word": orig_str,
+        }
+    m = DATE_YEAR_RE.search(text)
+    if m:
+        year = int(m.group(1))
+        orig_str = m.group(0)
+        new_year = year + rng.choice([-2, -1, 1, 2])
+        new_str = f"{new_year}년"
+        return text.replace(orig_str, new_str, 1), {
+            "label": "DATE", "wrong_word": new_str, "correct_word": orig_str,
+        }
+    return text, None
+
+
+def _perturb_law_name(text: str, rng: random.Random) -> tuple[str, dict | None]:
+    pairs = rng.sample(LAW_SUBSTITUTIONS, len(LAW_SUBSTITUTIONS))
+    for orig_law, new_law in pairs:
+        if orig_law in text:
+            return text.replace(orig_law, new_law, 1), {
+                "label": "LAW", "wrong_word": new_law, "correct_word": orig_law,
+            }
+    return text, None
+
+
+_PERTURB_FUNCS = [_perturb_article, _perturb_amount, _perturb_date, _perturb_law_name]
+_HALLU_TYPES = {
+    "_perturb_article":  "article_num",
+    "_perturb_amount":   "amount",
+    "_perturb_date":     "date",
+    "_perturb_law_name": "law_name",
 }
-CLEAN_DATA = {
-    "law": REPO_ROOT / "data" / "real_data" / "New_Dataset" / "rag_law_chunks.jsonl",
-    "case": REPO_ROOT / "data" / "real_data" / "New_Dataset" / "rag_case_chunks.jsonl",
-    "manual": REPO_ROOT / "data" / "real_data" / "New_Dataset" / "rag_manual_chunks.jsonl",
-}
-
-SYSTEM_PROMPT_HALLU = """당신은 한국 법률 텍스트에서 환각(hallucination)을 탐지하는 평가 데이터를 생성하는 전문가입니다.
-주어진 정상 법률 문서를 기반으로, 의도적으로 오류가 포함된 답변(환각)을 생성하세요.
-
-오류 유형:
-1. law_name: 법령 이름을 잘못된 것으로 교체 (예: 근로기준법 → 노동기준법)
-2. article_num: 조문 번호 변경 (예: 제43조 → 제37조)
-3. date: 날짜/기간 변경 (예: 30일 → 7일)
-4. amount: 금액/수량 변경 (예: 500만원 → 300만원)
-5. org: 기관명 변경 (예: 대법원 → 헌법재판소)
-
-규칙:
-- 원문에서 1-2개 항목만 변경하여 자연스러운 환각 답변 생성
-- 나머지 내용은 원문과 동일하게 유지
-- 변경 내용을 mismatches에 정확히 기록
-
-JSON 형식으로만 응답:
-{
-  "hallucinated_answer": "...",
-  "mismatches": [
-    {"label": "LAW", "wrong_word": "노동기준법", "correct_word": "근로기준법"},
-    ...
-  ]
-}"""
 
 
-def load_jsonl(path: Path, max_records: int = 5000) -> list[dict]:
-    records = []
-    if not path.exists():
-        return records
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            if line.strip():
-                records.append(json.loads(line))
-                if len(records) >= max_records:
-                    break
-    return records
+def make_positive(chunk: dict, rng: random.Random) -> dict | None:
+    text = chunk.get("text", "")[:500]
+    for func in rng.sample(_PERTURB_FUNCS, len(_PERTURB_FUNCS)):
+        new_text, mismatch = func(text, rng)
+        if mismatch:
+            return {
+                "answer": new_text,
+                "rag_docs": [{"text": text, "metadata": chunk.get("metadata", {})}],
+                "is_hallucination": True,
+                "hallucination_type": _HALLU_TYPES[func.__name__],
+                "expected_mismatches": [mismatch],
+            }
+    return None
 
 
-def bio_to_text(record: dict) -> str:
-    """BIO 형식 레코드를 텍스트로 변환."""
-    return "".join(record.get("tokens", []))
-
-
-def extract_entities_from_bio(record: dict) -> list[dict]:
-    """BIO 태그에서 엔티티 추출."""
-    tokens = record.get("tokens", [])
-    tags = record.get("ner_tags", [])
-    entities = []
-    i = 0
-    while i < len(tags):
-        if tags[i].startswith("B-"):
-            label = tags[i][2:]
-            start = i
-            j = i + 1
-            while j < len(tags) and tags[j] == f"I-{label}":
-                j += 1
-            span = "".join(tokens[start:j])
-            entities.append({"label": label, "span": span, "start": start, "end": j})
-            i = j
-        else:
-            i += 1
-    return entities
-
-
-def build_positive_from_ner_factcheck(records: list[dict]) -> list[dict]:
-    """ner_factcheck_eval.jsonl에서 positive 샘플 추출."""
-    positives = []
-    for rec in records:
-        mismatches = rec.get("expected_mismatches", [])
-        if not mismatches:
+def load_chunks(max_n: int = 6000) -> list[dict]:
+    chunks: list[dict] = []
+    for path in CORPUS_PATHS:
+        if not path.exists():
             continue
-        positives.append({
-            "eval_id": f"factcheck_{rec.get('id', 'unknown')}",
-            "answer": rec.get("answer", ""),
-            "rag_docs": rec.get("rag_docs", []),
-            "is_hallucination": True,
-            "hallucination_type": mismatches[0].get("label", "unknown").lower() if mismatches else "unknown",
-            "expected_mismatches": mismatches,
-            "source": "ner_factcheck",
-        })
-    return positives
-
-
-def build_negative_from_ner_factcheck(records: list[dict]) -> list[dict]:
-    """ner_factcheck_eval.jsonl에서 negative 샘플 추출."""
-    negatives = []
-    for rec in records:
-        if rec.get("expected_mismatches"):
-            continue
-        negatives.append({
-            "eval_id": f"factcheck_{rec.get('id', 'unknown')}_neg",
-            "answer": rec.get("answer", ""),
-            "rag_docs": rec.get("rag_docs", []),
-            "is_hallucination": False,
-            "hallucination_type": "none",
-            "expected_mismatches": [],
-            "source": "ner_factcheck_neg",
-        })
-    return negatives
-
-
-def build_negative_from_clean(clean_chunks: list[dict], n: int, rng: random.Random) -> list[dict]:
-    """정상 청크에서 negative 샘플 생성."""
-    sampled = rng.sample(clean_chunks, min(n, len(clean_chunks)))
-    negatives = []
-    for i, chunk in enumerate(sampled):
-        text = chunk.get("text", "")
-        if len(text) < 50:
-            continue
-        # 정상 답변 형태로 구성 (RAG 문서 = 자기 자신)
-        negatives.append({
-            "eval_id": f"clean_{i:04d}",
-            "answer": text[:500],
-            "rag_docs": [{"text": text, "metadata": chunk.get("metadata", {})}],
-            "is_hallucination": False,
-            "hallucination_type": "none",
-            "expected_mismatches": [],
-            "source": "clean_chunk",
-        })
-    return negatives
-
-
-def call_openai_hallucinate(client, text: str) -> dict | None:
-    """OpenAI API로 환각 데이터 생성."""
-    import openai
-
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT_HALLU},
-                {"role": "user", "content": f"다음 법률 문서를 기반으로 환각 답변을 생성하세요:\n\n{text[:600]}"},
-            ],
-            temperature=0.8,
-            max_tokens=800,
-            response_format={"type": "json_object"},
-        )
-        return json.loads(response.choices[0].message.content)
-    except Exception as e:
-        print(f"[WARN] OpenAI 호출 실패: {e}", file=sys.stderr)
-        return None
-
-
-def build_positive_from_openai(client, clean_chunks: list[dict], n: int, rng: random.Random, delay: float) -> list[dict]:
-    """OpenAI로 환각 positive 샘플 생성."""
-    sampled = rng.sample(clean_chunks, min(n, len(clean_chunks)))
-    positives = []
-
-    for i, chunk in enumerate(sampled):
-        print(f"  [환각 생성] {i+1}/{len(sampled)}")
-        text = chunk.get("text", "")
-        if len(text) < 100:
-            continue
-
-        result = call_openai_hallucinate(client, text)
-        if not result or not result.get("hallucinated_answer"):
-            continue
-
-        mismatches = result.get("mismatches", [])
-        hallu_type = mismatches[0].get("label", "unknown").lower() if mismatches else "unknown"
-
-        positives.append({
-            "eval_id": f"openai_hallu_{i:04d}",
-            "answer": result["hallucinated_answer"],
-            "rag_docs": [{"text": text, "metadata": chunk.get("metadata", {})}],
-            "is_hallucination": True,
-            "hallucination_type": hallu_type,
-            "expected_mismatches": mismatches,
-            "source": "openai_generated",
-        })
-
-        if delay > 0:
-            time.sleep(delay)
-
-    return positives
+        try:
+            with path.open(encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    text = rec.get("text", "")
+                    if len(text) < 150:
+                        continue
+                    chunks.append({
+                        "chunk_id": rec.get("chunk_id") or rec.get("id", ""),
+                        "text": text,
+                        "metadata": rec.get("metadata", {}),
+                    })
+                    if len(chunks) >= max_n:
+                        break
+        except Exception as e:
+            print(f"[WARN] 로드 실패: {path.name} - {e}", file=sys.stderr)
+        gc.collect()
+        if len(chunks) >= max_n:
+            break
+    return chunks
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="환각 탐지 평가 데이터 생성")
-    parser.add_argument("--n-positive", type=int, default=150, help="positive 샘플 수 (기본 150)")
-    parser.add_argument("--n-negative", type=int, default=150, help="negative 샘플 수 (기본 150)")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--n-positive", type=int, default=150)
+    parser.add_argument("--n-negative", type=int, default=150)
     parser.add_argument("--output", type=Path, default=OUT_FILE)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--delay", type=float, default=0.5)
-    parser.add_argument(
-        "--no-openai",
-        action="store_true",
-        help="OpenAI API 없이 기존 데이터만 사용",
-    )
     args = parser.parse_args()
 
     rng = random.Random(args.seed)
+    need = args.n_positive + args.n_negative
 
-    import openai
+    print("청크 로드 중...")
+    all_chunks = load_chunks(max_n=need * 4)
+    print(f"로드된 청크: {len(all_chunks)}개")
+    if len(all_chunks) < need:
+        print(f"[WARN] 청크 {len(all_chunks)}개로 목표 {need}개 미달, 가능한 만큼 생성합니다", file=sys.stderr)
 
-    client = openai.OpenAI() if not args.no_openai else None
+    rng.shuffle(all_chunks)
+    half = len(all_chunks) // 2
+    pos_pool = all_chunks[:half]
+    neg_pool = all_chunks[half:]
 
-    print("=== 환각 탐지 평가 데이터 생성 ===")
+    # ── Positive 생성 ────────────────────────────────────────────────────────
+    positives: list[dict] = []
+    print(f"Positive 생성 중 (목표: {args.n_positive}개)...", flush=True)
+    for chunk in pos_pool:
+        if len(positives) >= args.n_positive:
+            break
+        rec = make_positive(chunk, rng)
+        if rec:
+            positives.append(rec)
 
-    # --- Positive 샘플 구성 ---
-    positives = []
+    print(f"  → {len(positives)}개 생성")
 
-    # 1) ner_factcheck_eval에서 기존 positive 추출
-    factcheck_recs = load_jsonl(HALLU_DATA["ner_factcheck"])
-    positives.extend(build_positive_from_ner_factcheck(factcheck_recs))
-    print(f"기존 positive (factcheck): {len(positives)}개")
-
-    # 2) manual_hallu.jsonl → positive (내용에 의도적 오류 포함된 청크)
-    manual_hallu = load_jsonl(HALLU_DATA["manual_hallu"])
-    for i, rec in enumerate(rng.sample(manual_hallu, min(50, len(manual_hallu)))):
-        text = rec.get("text", "")
-        if len(text) < 50:
+    # ── Negative 생성 ────────────────────────────────────────────────────────
+    negatives: list[dict] = []
+    print(f"Negative 생성 중 (목표: {args.n_negative}개)...", flush=True)
+    for chunk in neg_pool:
+        if len(negatives) >= args.n_negative:
+            break
+        text = chunk.get("text", "")[:500]
+        if len(text) < 100:
             continue
-        # manual_hallu는 오류 주입된 텍스트 — 자체가 positive
-        positives.append({
-            "eval_id": f"manual_hallu_{i:04d}",
-            "answer": text[:500],
-            "rag_docs": [{"text": text, "metadata": rec.get("metadata", {})}],
-            "is_hallucination": True,
-            "hallucination_type": "injected",
+        negatives.append({
+            "answer": text,
+            "rag_docs": [{"text": text, "metadata": chunk.get("metadata", {})}],
+            "is_hallucination": False,
+            "hallucination_type": "none",
             "expected_mismatches": [],
-            "source": "manual_hallu",
         })
-    print(f"manual_hallu 추가 후 positive: {len(positives)}개")
 
-    # 3) OpenAI로 추가 positive 생성
-    remaining_positive = args.n_positive - len(positives)
-    if remaining_positive > 0 and client is not None:
-        clean_law = load_jsonl(CLEAN_DATA["law"], max_records=500)
-        clean_case = load_jsonl(CLEAN_DATA["case"], max_records=500)
-        clean_pool = clean_law + clean_case
-        if clean_pool:
-            print(f"OpenAI로 positive {remaining_positive}개 추가 생성 중...")
-            new_positives = build_positive_from_openai(client, clean_pool, remaining_positive, rng, args.delay)
-            positives.extend(new_positives)
-    elif remaining_positive > 0:
-        print(f"[INFO] --no-openai 옵션으로 OpenAI 생성 건너뜀")
+    print(f"  → {len(negatives)}개 생성")
 
-    # positive 최대 n개로 제한
-    positives = rng.sample(positives, min(args.n_positive, len(positives)))
-    print(f"최종 positive: {len(positives)}개")
-
-    # --- Negative 샘플 구성 ---
-    negatives = []
-
-    # 1) factcheck에서 negative 추출
-    negatives.extend(build_negative_from_ner_factcheck(factcheck_recs))
-    print(f"factcheck negative: {len(negatives)}개")
-
-    # 2) 정상 청크에서 negative 생성
-    all_clean = []
-    for path in CLEAN_DATA.values():
-        all_clean.extend(load_jsonl(path, max_records=1000))
-
-    remaining_negative = args.n_negative - len(negatives)
-    if all_clean and remaining_negative > 0:
-        new_negatives = build_negative_from_clean(all_clean, remaining_negative, rng)
-        negatives.extend(new_negatives)
-
-    negatives = rng.sample(negatives, min(args.n_negative, len(negatives)))
-    print(f"최종 negative: {len(negatives)}개")
-
-    # --- 합치고 셔플 ---
+    # ── 합치고 셔플 ──────────────────────────────────────────────────────────
     all_records = positives + negatives
     rng.shuffle(all_records)
-
-    # eval_id 재부여
     for i, rec in enumerate(all_records):
         rec["eval_id"] = f"hallu_eval_{i:04d}"
 
-    # --- 저장 ---
+    all_chunks = positives = negatives = None
+    gc.collect()
+
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("w", encoding="utf-8") as fout:
         for rec in all_records:
@@ -340,31 +261,23 @@ def main() -> None:
 
 def _print_stats(path: Path) -> None:
     from collections import Counter
-
     pos = neg = 0
     type_counts: Counter = Counter()
-    source_counts: Counter = Counter()
-
-    with path.open("r", encoding="utf-8") as f:
+    with path.open(encoding="utf-8") as f:
         for line in f:
+            line = line.strip()
+            if not line:
+                continue
             rec = json.loads(line)
             if rec["is_hallucination"]:
                 pos += 1
             else:
                 neg += 1
             type_counts[rec.get("hallucination_type", "none")] += 1
-            source_counts[rec.get("source", "unknown")] += 1
-
     total = pos + neg
-    print(f"\n=== 데이터 통계 ===")
-    print(f"총: {total} (positive: {pos}, negative: {neg})")
-    print(f"비율: positive {pos/total*100:.1f}% / negative {neg/total*100:.1f}%")
-    print("\n환각 유형 분포:")
+    print(f"\n=== Hallu 통계 ===\n총 {total}개 (pos: {pos}, neg: {neg})")
     for t, c in sorted(type_counts.items(), key=lambda x: -x[1]):
         print(f"  {t:20s}: {c:4d}")
-    print("\n데이터 출처:")
-    for s, c in sorted(source_counts.items(), key=lambda x: -x[1]):
-        print(f"  {s:25s}: {c:4d}")
 
 
 if __name__ == "__main__":

@@ -4,5 +4,6 @@
   "python.terminal.activateEnvInCurrentTerminal": true,
   "terminal.integrated.env.windows": {
     "PATH": "${workspaceFolder}\\.venv\\Scripts;${env:PATH}"
-  }
+  },
+  "claudeCodeChat.permissions.yoloMode": false
 }
