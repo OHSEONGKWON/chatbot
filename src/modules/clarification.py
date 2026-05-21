@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 from ..config import config
 from .llm_client import llm_client
@@ -61,8 +61,6 @@ REQUERY_SYSTEM = """당신은 법률 상담 AI입니다.
 질문은 반드시 하나만 하세요.
 친근하고 간결하게 작성하세요."""
 
-GENERAL_FALLBACK_MESSAGE = "대답에 필요한 정보가 충분하지 않아 일반적인 기준으로 대답하겠습니다."
-
 
 @dataclass
 class EvalResult:
@@ -81,6 +79,7 @@ class ClarificationResult:
     use_general: bool
     legal_category: str
     eval: Optional[EvalResult]
+    route: Optional[Any] = None
 
 
 def _safe_json_loads(raw: str) -> dict:
@@ -593,7 +592,7 @@ class ClarificationManager:
         legal_category: str = "불명확",
     ) -> str:
         if retry_count > self._cfg.max_retries:
-            return GENERAL_FALLBACK_MESSAGE
+            return config.clarification.fallback_message
 
         normalized_entity_check = _normalize_entity_check(entity_check or {})
         normalized_missing = _normalize_missing_elements(missing)
@@ -650,6 +649,7 @@ class ClarificationManager:
                 use_general=True,
                 legal_category=eval_result.legal_category,
                 eval=eval_result,
+                route={"issue": self._infer_issue(context, eval_result.legal_category)},
             )
 
         if not eval_result.can_proceed:
@@ -670,6 +670,7 @@ class ClarificationManager:
                 use_general=False,
                 legal_category=eval_result.legal_category,
                 eval=eval_result,
+                route={"issue": self._infer_issue(context, eval_result.legal_category)},
             )
 
         return ClarificationResult(
@@ -679,6 +680,7 @@ class ClarificationManager:
             use_general=False,
             legal_category=eval_result.legal_category,
             eval=eval_result,
+            route={"issue": self._infer_issue(context, eval_result.legal_category)},
         )
 
 

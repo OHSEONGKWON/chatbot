@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Optional
 
 from ..config import config
+
+logger = logging.getLogger("lawsguard.llm")
 
 
 class LLMClient:
@@ -34,7 +37,8 @@ class LLMClient:
             if config.llm.api_base:
                 kwargs["base_url"] = config.llm.api_base
             self._client = AsyncOpenAI(**kwargs)
-        except Exception:
+        except Exception as e:
+            logger.error(f"OpenAI 클라이언트 초기화 실패: {e}")
             self._client = None
         return self._client
 
@@ -52,6 +56,7 @@ class LLMClient:
     ) -> str:
         client = self._get_client()
         if client is None:
+            logger.error("LLM 클라이언트 없음 — API 키 또는 초기화 확인 필요")
             return ""
 
         if prompt is None:
@@ -75,7 +80,8 @@ class LLMClient:
                 request_kwargs["response_format"] = {"type": "json_object"}
             response = await client.chat.completions.create(**request_kwargs)
             return (response.choices[0].message.content or "").strip()
-        except Exception:
+        except Exception as e:
+            logger.error(f"LLM 호출 실패: {e}")
             if json_mode:
                 try:
                     request_kwargs = {
@@ -86,7 +92,8 @@ class LLMClient:
                     }
                     response = await client.chat.completions.create(**request_kwargs)
                     return (response.choices[0].message.content or "").strip()
-                except Exception:
+                except Exception as e2:
+                    logger.error(f"LLM 재시도 실패: {e2}")
                     return ""
             return ""
 
