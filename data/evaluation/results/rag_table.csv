@@ -1,0 +1,8 @@
+﻿시스템,Hit@1,Hit@5,Hit@10,MRR@10,NDCG@10,N
+BM25,0.0867,0.1933,0.3,0.1237,0.0837,150
+Dense (multilingual-E5-large),0.22,0.44,0.4667,0.3107,0.2538,150
+Hybrid (multilingual-E5-large),0.3333,0.42,0.4667,0.3741,0.2055,150
+Dense (ko-SRoBERTa-multitask),0.24,0.4,0.42,0.3091,0.2802,150
+Hybrid (ko-SRoBERTa-multitask),0.2267,0.3333,0.42,0.2834,0.1948,150
+Dense (KoSimCSE-RoBERTa),0.1333,0.3467,0.36,0.2077,0.1586,150
+Hybrid (KoSimCSE-RoBERTa),0.28,0.3267,0.4067,0.3037,0.1527,150

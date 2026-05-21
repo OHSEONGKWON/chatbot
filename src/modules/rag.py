@@ -101,12 +101,12 @@ class LegalRetriever:
         self._query_cache: OrderedDict[tuple[str, int, str], list[dict[str, Any]]] = OrderedDict()
         self._query_cache_size = 64
 
-    async def retrieve_async(self, query: str, top_k: int | None = None, legal_category: str = "") -> list[dict[str, Any]]:
-        return await asyncio.to_thread(self.retrieve, query, top_k, legal_category)
+    async def retrieve_async(self, query: str, top_k: int | None = None, legal_category: str = "", case_frame: Any | None = None, issue_plan: Any | None = None) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(self.retrieve, query, top_k, legal_category, case_frame, issue_plan)
 
-    def retrieve(self, query: str, top_k: int | None = None, legal_category: str = "") -> list[dict[str, Any]]:
+    def retrieve(self, query: str, top_k: int | None = None, legal_category: str = "", case_frame: Any | None = None, issue_plan: Any | None = None) -> list[dict[str, Any]]:
         top_k = top_k or config.rag.top_k
-        cache_key = (re.sub(r"\s+", " ", (query or "")).strip().lower(), top_k, legal_category or "")
+        cache_key = (re.sub(r"\s+", " ", (query or "")).strip().lower(), top_k, legal_category or "", str(getattr(case_frame, "condition_or_exchange", "")), str(getattr(case_frame, "unpaid_claim", "")), str(getattr(issue_plan, "primary_issue", "")))
         cached = self._query_cache.get(cache_key)
         if cached is not None:
             self._query_cache.move_to_end(cache_key)
@@ -219,10 +219,10 @@ class LegalRetriever:
         self._jsonl_cache = docs
         return docs
 
-    def _retrieve_from_jsonl(self, query: str, top_k: int, legal_category: str = "") -> list[RAGDocument]:
+    def _retrieve_from_jsonl(self, query: str, top_k: int, legal_category: str = "", case_frame: Any | None = None, issue_plan: Any | None = None) -> list[RAGDocument]:
         category = legal_category or self._infer_category(query)
-        issues = self.infer_issues(query, category=category)
-        query_tokens = self._expand_query_tokens(query, category, issues=issues)
+        issues = [getattr(issue_plan, "primary_issue", "")] if getattr(issue_plan, "primary_issue", "") else self.infer_issues(query, category=category)
+        query_tokens = self._expand_query_tokens(query, category, issues=issues, case_frame=case_frame, issue_plan=issue_plan)
         if not query_tokens:
             return []
         self._ensure_bm25_index()
@@ -236,8 +236,8 @@ class LegalRetriever:
             if bm25 <= 0:
                 continue
             issue_boost, issue_reasons = self._issue_boost(haystack, doc.metadata, issues)
-            score = bm25 + self._domain_boost(query, haystack, category) + self._metadata_boost(doc.metadata, category) + issue_boost
-            score -= self._cross_domain_penalty(haystack, category)
+            score = bm25 + self._domain_boost(query, haystack, category, case_frame=case_frame, issue_plan=issue_plan) + self._metadata_boost(doc.metadata, category) + issue_boost
+            score -= self._cross_domain_penalty(haystack, category, case_frame=case_frame, issue_plan=issue_plan)
             if score > 0:
                 scored.append(
                     RAGDocument(
@@ -249,7 +249,7 @@ class LegalRetriever:
                     )
                 )
         scored.sort(key=lambda doc: doc.score, reverse=True)
-        return self._balance_sources(scored, top_k, category, issues=issues)
+        return self._balance_sources(scored, top_k, category, issues=issues, issue_plan=issue_plan)
 
     def _ensure_bm25_index(self):
         if self._bm25_index is not None:
@@ -296,7 +296,7 @@ class LegalRetriever:
     def _tokenize_for_index(self, text: str) -> list[str]:
         return re.findall(r"[0-9A-Za-z가-힣]{2,}", text.lower())
 
-    def _expand_query_tokens(self, text: str, category: str = "", issues: list[str] | None = None) -> list[str]:
+    def _expand_query_tokens(self, text: str, category: str = "", issues: list[str] | None = None, case_frame: Any | None = None, issue_plan: Any | None = None) -> list[str]:
         tokens = self._tokenize_for_index(text)
         aliases = {
             "알바": "근로 임금 아르바이트 근로계약서 사업주",
@@ -312,15 +312,34 @@ class LegalRetriever:
             "거절": "동의 강제추행 피해자 진술",
             "해고": "근로 해고 부당해고",
         }
+        suppress_wage = bool(getattr(case_frame, "condition_or_exchange", None)) and not bool(getattr(case_frame, "unpaid_claim", None))
         for key, expansion in aliases.items():
             if key in text:
+                if suppress_wage and key in {"알바", "월급", "급여", "못 받", "안 줬", "체불", "알바비"}:
+                    continue
                 tokens.extend(expansion.split())
         if category == "노동":
-            tokens.extend("근로기준법 임금 근로계약서 고용노동부 사업주 지급".split())
+            if suppress_wage:
+                tokens.extend("고용 사업주 직장 내 성희롱 성적 요구 남녀고용평등법".split())
+            else:
+                tokens.extend("근로기준법 임금 근로계약서 고용노동부 사업주 지급".split())
         elif category == "성폭력":
             tokens.extend("성폭력 성희롱 강제추행 피해자 보호 상담 신고 동의".split())
+
+        # IssuePlan이 있으면 검색어를 사실 역할과 필요한 법령 중심으로 보정한다.
+        if issue_plan is not None:
+            tokens.extend(str(getattr(issue_plan, "primary_issue", "")).split())
+            for law in getattr(issue_plan, "needed_laws", []) or []:
+                tokens.extend(str(law).split())
+            for focus in getattr(issue_plan, "answer_focus", []) or []:
+                tokens.extend(str(focus).split())
+
         for issue in issues or []:
-            tokens.extend(str(ISSUE_SPECS.get(issue, {}).get("expand", "")).split())
+            if issue in ISSUE_SPECS:
+                tokens.extend(str(ISSUE_SPECS.get(issue, {}).get("expand", "")).split())
+        if suppress_wage:
+            blocked = {"임금체불", "미지급", "급여일", "주휴수당", "체불임금", "제43조"}
+            tokens = [token for token in tokens if token not in blocked]
         return tokens
 
     def _lexical_score(self, terms: set[str], text: str) -> float:
@@ -332,9 +351,19 @@ class LegalRetriever:
                 score += 1.0 + math.log(count)
         return score
 
-    def _domain_boost(self, query: str, text: str, category: str = "") -> float:
+    def _domain_boost(self, query: str, text: str, category: str = "", case_frame: Any | None = None, issue_plan: Any | None = None) -> float:
         boost = 0.0
-        if category == "노동" or any(term in query for term in ["알바", "아르바이트", "임금", "월급", "체불", "근로", "급여", "못 받", "안 줬"]):
+        suppress_wage = bool(getattr(case_frame, "condition_or_exchange", None)) and not bool(getattr(case_frame, "unpaid_claim", None))
+        if suppress_wage:
+            if "직장 내 성희롱" in text or "성희롱" in text:
+                boost += 12.0
+            if "남녀고용평등" in text or "양성평등기본법" in text:
+                boost += 10.0
+            if "성적 요구" in text or "성적 언동" in text or "불리한 처우" in text:
+                boost += 6.0
+            if "임금체불" in text or "주휴수당" in text or "급여일" in text:
+                boost -= 10.0
+        elif category == "노동" or any(term in query for term in ["알바", "아르바이트", "임금", "월급", "체불", "근로", "급여", "못 받", "안 줬"]):
             if "근로계약서" in text:
                 boost += 8.0
             if "임금체불" in text or "임금을 지급" in text or "임금은" in text:
@@ -426,7 +455,12 @@ class LegalRetriever:
                 reasons.append(f"{issue}:{issue_boost:.1f}")
         return boost, f", issue_boost={';'.join(reasons)}" if reasons else ""
 
-    def _cross_domain_penalty(self, text: str, category: str) -> float:
+    def _cross_domain_penalty(self, text: str, category: str, case_frame: Any | None = None, issue_plan: Any | None = None) -> float:
+        if bool(getattr(case_frame, "condition_or_exchange", None)) and not bool(getattr(case_frame, "unpaid_claim", None)):
+            wage_hits = sum(text.count(term) for term in ["임금체불", "주휴수당", "급여일", "체불임금", "미지급"])
+            harassment_hits = sum(text.count(term) for term in ["성희롱", "성적 요구", "성적 언동", "남녀고용평등", "불리한 처우"])
+            if wage_hits > harassment_hits:
+                return 12.0
         if category == "노동":
             sexual_hits = sum(text.count(term) for term in ["성폭력", "성희롱", "강제추행", "성범죄"])
             labor_hits = sum(text.count(term) for term in ["근로", "임금", "노동", "고용", "계약"])
@@ -441,7 +475,7 @@ class LegalRetriever:
                 return 14.0
         return 0.0
 
-    def _balance_sources(self, docs: list[RAGDocument], top_k: int, category: str, issues: list[str] | None = None) -> list[RAGDocument]:
+    def _balance_sources(self, docs: list[RAGDocument], top_k: int, category: str, issues: list[str] | None = None, issue_plan: Any | None = None) -> list[RAGDocument]:
         selected = []
         preferred_slots = ["statute", "manual", "statute"]
         if category == "성폭력":
@@ -499,6 +533,71 @@ class LegalRetriever:
         if any(term in query for term in ["알바", "알바비", "아르바이트", "임금", "월급", "급여", "근로", "해고", "퇴직금"]):
             return "노동"
         return ""
+
+
+    def evaluate_retrieval(self, query: str, docs: list[dict[str, Any]], legal_category: str = "", case_frame: Any | None = None, issue_plan: Any | None = None) -> dict[str, Any]:
+        """RRS: CaseFrame/IssuePlan 기준 RAG 근거 품질 평가."""
+        docs = docs or []
+        joined = "\n".join((doc.get("text") or "") + " " + json.dumps(doc.get("metadata") or {}, ensure_ascii=False) for doc in docs)
+        top_scores = [float(doc.get("score") or 0.0) for doc in docs[:3]]
+        if top_scores:
+            # BM25와 vector score 스케일 차이를 완화하기 위한 saturating normalization
+            top_doc_relevance = min(1.0, max(top_scores) / (max(top_scores) + 8.0)) if max(top_scores) > 1.0 else max(top_scores)
+        else:
+            top_doc_relevance = 0.0
+
+        expected_laws = list(getattr(issue_plan, "needed_laws", []) or [])
+        matched_laws = [law for law in expected_laws if law and any(part in joined for part in str(law).split())]
+        legal_basis_coverage = len(matched_laws) / max(1, len(expected_laws)) if expected_laws else (top_doc_relevance * 0.5 if docs else 0.0)
+
+        primary_issue = str(getattr(issue_plan, "primary_issue", "") or "")
+        focus_terms = [primary_issue] + list(getattr(issue_plan, "answer_focus", []) or [])
+        focus_tokens = []
+        for term in focus_terms:
+            focus_tokens.extend(re.findall(r"[0-9A-Za-z가-힣]{2,}", str(term)))
+        focus_tokens = list(dict.fromkeys(focus_tokens))[:12]
+        issue_hits = sum(1 for token in focus_tokens if token in joined)
+        issue_match = issue_hits / max(1, min(len(focus_tokens), 6)) if focus_tokens else (0.5 if docs else 0.0)
+        issue_match = min(1.0, issue_match)
+
+        excluded = list(getattr(issue_plan, "excluded_issues", []) or []) + list(getattr(case_frame, "not_claimed", []) or [])
+        excluded_hits = [term for term in excluded if term and term in joined]
+        domain_consistency = max(0.0, 1.0 - 0.18 * len(excluded_hits))
+
+        score = (
+            0.30 * top_doc_relevance
+            + 0.25 * issue_match
+            + 0.25 * legal_basis_coverage
+            + 0.20 * domain_consistency
+        )
+        # 필수 gate: 법률 근거가 매우 약하면 caution으로 낮춘다.
+        action = "answer"
+        if issue_match < 0.55 or domain_consistency < 0.65:
+            score = min(score, 0.54)
+            action = "requery_or_safe_fallback"
+        elif legal_basis_coverage < 0.30:
+            score = min(score, 0.71)
+            action = "answer_with_caution"
+        elif score < 0.72:
+            action = "retry_retrieval_or_caution"
+        elif score < 0.85:
+            action = "answer_with_caution"
+
+        return {
+            "score": round(max(0.0, min(1.0, score)), 3),
+            "passed": score >= 0.72,
+            "action": action,
+            "top_doc_relevance": round(top_doc_relevance, 3),
+            "issue_match": round(issue_match, 3),
+            "legal_basis_coverage": round(legal_basis_coverage, 3),
+            "domain_consistency": round(domain_consistency, 3),
+            "primary_issue": primary_issue,
+            "expected_laws": expected_laws,
+            "matched_laws": matched_laws,
+            "excluded_issue_hits": excluded_hits,
+            "doc_count": len(docs),
+            "thresholds": {"excellent": 0.85, "passable": 0.72, "fail": 0.55},
+        }
 
 
 retriever = LegalRetriever()

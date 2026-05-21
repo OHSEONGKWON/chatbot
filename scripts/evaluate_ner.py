@@ -93,36 +93,41 @@ LEGAL_TAG_MAP = {
     "PENALTY": "PENALTY",
 }
 
-# 외부 모델 태그 → 우리 카테고리 매핑 (최선 노력)
+# 외부 모델 태그 → 우리 카테고리 매핑
 GENERAL_TAG_MAP = {
-    # naver/modu NER
+    # ── babelscape/wikineural-multilingual (B-PER/B-ORG/B-LOC/B-MISC) ──
+    "B-ORG": "ORG",   "I-ORG": "ORG",
+    "B-MISC": "LAW",  "I-MISC": "LAW",   # 법령명 = miscellaneous
+    "B-LOC": "ORG",   "I-LOC": "ORG",    # 법원·기관 위치 기반 표기
+    # ── monologg/koelectra-base-v3-naver-ner (PER/FLD/AFW/ORG/LOC/CVL/DAT/TIM/NUM/EVN) ──
+    "B-ORG": "ORG",   "I-ORG": "ORG",
+    "B-DAT": "DATE",  "I-DAT": "DATE",
+    "B-TIM": "DATE",  "I-TIM": "DATE",
+    "B-NUM": "AMOUNT","I-NUM": "AMOUNT",
+    "B-CVL": "LAW",   "I-CVL": "LAW",    # 문화·제도 → 법령
+    "B-EVN": "CRIME", "I-EVN": "CRIME",  # 사건·사고 → 범죄
+    "B-AFW": "PENALTY","I-AFW": "PENALTY", # 인공물·처분 → 형벌
+    # ── Leo97/KoELECTRA-small-v3-modu-ner (prefix 없는 형태) ──
     "ORG": "ORG",
-    "ORG-B": "ORG",
-    "ORG-I": "ORG",
-    "DAT": "DATE",
-    "DAT-B": "DATE",
-    "DAT-I": "DATE",
-    "TIM": "DATE",
-    "TIM-B": "DATE",
-    "TIM-I": "DATE",
+    "DAT": "DATE",  "TIM": "DATE",
     "NUM": "AMOUNT",
-    "NUM-B": "AMOUNT",
-    "NUM-I": "AMOUNT",
-    "CVL": "CRIME",  # civilization → crime 근사
-    # babelscape wikineural
-    "B-ORG": "ORG",
-    "I-ORG": "ORG",
-    "B-MISC": "LAW",  # Miscellaneous → 법률 근사
-    "I-MISC": "LAW",
-    # KLUE NER
-    "B-LC": "ORG",  # Location/Company
-    "I-LC": "ORG",
-    "B-OG": "ORG",
-    "I-OG": "ORG",
-    "B-DT": "DATE",
-    "I-DT": "DATE",
-    "B-QT": "AMOUNT",
-    "I-QT": "AMOUNT",
+    "CVL": "LAW",
+    "EVN": "CRIME",
+    "AFW": "PENALTY",
+    # ── KLUE NER 형식 (OG/LC/PS/DT/TI/QT/FD/TR/AF/CV/AM/PT/MT/TM) ──
+    "B-OG": "ORG",  "I-OG": "ORG",
+    "B-LC": "ORG",  "I-LC": "ORG",    # 법원 등 기관명이 지명 태그로 나오는 경우
+    "B-DT": "DATE", "I-DT": "DATE",
+    "B-TI": "DATE", "I-TI": "DATE",
+    "B-QT": "AMOUNT","I-QT": "AMOUNT",
+    "B-CV": "LAW",  "I-CV": "LAW",    # 문화·제도 → 법령
+    "B-TR": "LAW",  "I-TR": "LAW",    # 이론·제도
+    "B-AF": "PENALTY","I-AF": "PENALTY", # 인공물·처분
+    # ── 접두사 없는 레이블 (일부 모델 출력 형식) ──
+    "ORG-B": "ORG", "ORG-I": "ORG",
+    "DAT-B": "DATE","DAT-I": "DATE",
+    "TIM-B": "DATE","TIM-I": "DATE",
+    "NUM-B": "AMOUNT","NUM-I": "AMOUNT",
 }
 
 EVAL_ENTITY_TYPES = ["LAW", "ORG", "DATE", "AMOUNT", "CRIME", "PENALTY"]

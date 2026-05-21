@@ -110,8 +110,7 @@ async def run_pipeline_and_callback(user_id: str, user_input: str, callback_url:
 
         logger.info(
             f"파이프라인 완료 | user={user_id[:8]}... | step={result.step_reached} | "
-            f"score={(f'{result.consistency_score:.3f}' if result.consistency_score is not None else 'N/A')} | "
-            f"legal={(f'{result.legal_reasoning_score:.3f}' if result.legal_reasoning_score is not None else 'N/A')} | "
+            f"reliability={(f'{result.answer_reliability:.3f}' if result.answer_reliability is not None else 'N/A')} | "
             f"time={elapsed:.2f}s"
         )
         callback_ok = await send_callback(
