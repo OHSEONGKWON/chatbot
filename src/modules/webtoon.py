@@ -17,7 +17,7 @@ logger = logging.getLogger("lawsguard.webtoon")
 OUTPUT_DIR = Path(__file__).resolve().parents[2] / "output"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-WEBTOON_IMAGE_SIZE = os.getenv("LAWSGUARD_WEBTOON_IMAGE_SIZE", "512x512")
+WEBTOON_IMAGE_SIZE = os.getenv("LAWSGUARD_WEBTOON_IMAGE_SIZE", "1024x1024")
 WEBTOON_IMAGE_QUALITY = os.getenv("LAWSGUARD_WEBTOON_IMAGE_QUALITY", "low")
 
 _SANITIZE_MAP = {
