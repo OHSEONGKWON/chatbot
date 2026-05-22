@@ -10,7 +10,7 @@ sys.path.insert(0, str(ROOT))
 from src.modules.ner_checker import NERFactChecker
 
 # 모델 설정
-os.environ['LAWSGUARD_NER_MODEL'] = 'outputs/legal-ner-lawsguard-v2-30k'
+os.environ['LAWSGUARD_NER_MODEL'] = 'outputs/legal-ner-v3'
 
 # 긴 카카오 형식 답변 (사진)
 kakao_long_answer = """(1) 상황 정리
@@ -51,7 +51,7 @@ kakao_answer_with_hallucination = """(1) 상황 정리
 합의 없이는 합의금 청구가 어렵습니다."""
 
 # NER 체커 생성
-checker = NERFactChecker(model_path='outputs/legal-ner-lawsguard-v2-30k')
+checker = NERFactChecker(model_path='outputs/legal-ner-v3')
 
 print("=" * 70)
 print("테스트 1: 일반 긴 답변 (환각 가능성 낮음)")

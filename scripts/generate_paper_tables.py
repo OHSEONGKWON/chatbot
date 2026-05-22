@@ -1,310 +1,322 @@
 """
-논문용 성능 평가 표 생성 스크립트
+논문 Table 생성 스크립트
 
-evaluate_ner.py, evaluate_rag.py, evaluate_hallucination.py 의 결과를
-논문에 바로 사용할 수 있는 형식으로 변환합니다.
+outputs/ 디렉토리의 평가 결과 JSON을 읽어 논문용 표 5개를 출력.
 
-출력:
-  - data/evaluation/results/paper_tables.md   (Markdown 표)
-  - data/evaluation/results/paper_tables.tex  (LaTeX 표)
-  - data/evaluation/results/summary.json      (모든 결과 통합)
+Table 1: NER 전체 Span F1 비교 (우리 모델 vs 베이스라인 3개)
+Table 2: NER 엔티티별 F1 (공동 엔티티 + 법률 전용 엔티티)
+Table 3: RAG 검색 성능 (BM25 / Dense / Hybrid - Hit@1, NDCG@5)
+Table 4: 환각 탐지 성능 비교 - 4개 모델
+         Ours(NER) / GPT-4o-mini(Judge) / NLI(klue/roberta) / MiniCheck(Flan-T5)
+Table 5: Ablation Study (RAG없음 → RAG → RAG+SIM → RAG+SIM+NER)
 
 사용법:
   python scripts/generate_paper_tables.py
+  python scripts/generate_paper_tables.py --latex   # LaTeX 형식 추가 출력
 """
 
 from __future__ import annotations
 
-import io
+import argparse
 import json
-import sys
+import os
 from pathlib import Path
 
-if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-if sys.stderr.encoding and sys.stderr.encoding.lower() not in ("utf-8", "utf8"):
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-RESULTS_DIR = REPO_ROOT / "data" / "evaluation" / "results"
-OUT_FILE_MD = RESULTS_DIR / "paper_tables.md"
-OUT_FILE_TEX = RESULTS_DIR / "paper_tables.tex"
-OUT_FILE_JSON = RESULTS_DIR / "summary.json"
 
+NER_RESULTS_PATH    = REPO_ROOT / "outputs" / "ner_compare_results.json"
+RAG_RESULTS_PATH    = REPO_ROOT / "outputs" / "rag_eval_results.json"
+HALLU_RESULTS_PATH  = REPO_ROOT / "outputs" / "hallucination_eval_results.json"
+ABLATION_RESULTS_PATH = REPO_ROOT / "outputs" / "ablation_results.json"
+
+ENTITY_TYPES = ["LAW", "ORG", "DATE", "AMOUNT", "CRIME", "PENALTY"]
+COMMON_ENTITIES  = ["ORG", "DATE", "AMOUNT"]
+LEGAL_ENTITIES   = ["LAW", "CRIME", "PENALTY"]
+
+
+# ── 유틸 ──────────────────────────────────────────────────────────────────────
 
 def load_json(path: Path) -> dict | None:
     if not path.exists():
+        print(f"[SKIP] 파일 없음: {path.name}")
         return None
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
 
 
-def fmt(v, decimals: int = 3) -> str:
-    if isinstance(v, float):
-        return f"{v:.{decimals}f}"
-    return str(v)
+def bold(val: float, best: float, delta: float = 0.001) -> str:
+    """콘솔 출력에서 best 값에 * 표시."""
+    s = f"{val:.4f}"
+    return f"*{s}*" if abs(val - best) < delta else s
 
 
-def bold_best(values: list[float]) -> list[str]:
-    """최고값에 bold 표시."""
-    if not values:
-        return []
-    best = max(values)
-    return [f"**{fmt(v)}**" if v == best else fmt(v) for v in values]
+def sep(width: int = 70) -> None:
+    print("-" * width)
 
 
-# ──────────────────────────────
-# Markdown 표 생성
-# ──────────────────────────────
+# ── Table 1: NER 전체 ─────────────────────────────────────────────────────────
 
-def make_ner_md(ner_results: dict) -> str:
-    lines = []
-    lines.append("## TABLE 1: NER 개체명 인식 성능 (Entity-level Span F1)\n")
-    lines.append("| 모델 | LAW | ORG | DATE | AMOUNT | CRIME | PENALTY | Macro F1 | Overall F1 |")
-    lines.append("|------|-----|-----|------|--------|-------|---------|----------|------------|")
+def table1_ner_overall(data: dict, latex: bool) -> None:
+    print("\n" + "=" * 70)
+    print("Table 1: NER 전체 Span F1 비교")
+    print("=" * 70)
 
-    entity_types = ["LAW", "ORG", "DATE", "AMOUNT", "CRIME", "PENALTY"]
-    rows = []
-    for model_key, result in ner_results.items():
-        pe = result.get("per_entity", {})
-        row_vals = [pe.get(t, {}).get("f1", 0.0) for t in entity_types]
-        macro = result.get("macro_f1", 0.0)
-        overall = result.get("overall", {}).get("f1", 0.0)
-        rows.append((model_key, row_vals, macro, overall))
+    header = f"{'모델':<40} {'Precision':>10} {'Recall':>8} {'F1':>8} {'MacroF1':>9}"
+    print(header)
+    sep()
 
-    # 각 열별 최고값 bold 처리
-    for model_key, row_vals, macro, overall in rows:
-        cells = [fmt(v) for v in row_vals] + [fmt(macro), fmt(overall)]
-        lines.append(f"| {model_key} | " + " | ".join(cells) + " |")
+    best_f1     = max(r.get("f1", 0) for r in data.values())
+    best_macro  = max(r.get("macro_f1", 0) for r in data.values())
 
-    lines.append("")
-    lines.append("*F1: span-level exact match, macro: 6개 엔티티 평균*\n")
-    return "\n".join(lines)
-
-
-def make_rag_md(rag_results: dict) -> str:
-    lines = []
-    lines.append("## TABLE 2: RAG 검색 성능\n")
-    lines.append("| 시스템 | Hit@1 | Hit@5 | Hit@10 | MRR@10 | NDCG@10 | N |")
-    lines.append("|--------|-------|-------|--------|--------|---------|---|")
-
-    for sys_name, metrics in rag_results.items():
-        row = (
-            f"| {sys_name} "
-            f"| {fmt(metrics.get('hit@1', 0.0))} "
-            f"| {fmt(metrics.get('hit@5', 0.0))} "
-            f"| {fmt(metrics.get('hit@10', 0.0))} "
-            f"| {fmt(metrics.get('mrr@10', 0.0))} "
-            f"| {fmt(metrics.get('ndcg@10', 0.0))} "
-            f"| {metrics.get('n', 0)} |"
+    for name, r in data.items():
+        p   = r.get("precision", 0)
+        rec = r.get("recall", 0)
+        f1  = r.get("f1", 0)
+        mf1 = r.get("macro_f1", 0)
+        print(
+            f"{name:<40} {p:>10.4f} {rec:>8.4f} "
+            f"{bold(f1, best_f1):>8} {bold(mf1, best_macro):>9}"
         )
-        lines.append(row)
 
-    lines.append("")
-    lines.append("*Hit@k: top-k 내 정답 문서 포함 비율, MRR: Mean Reciprocal Rank, NDCG: Normalized DCG*\n")
-    return "\n".join(lines)
+    if latex:
+        print("\n[LaTeX]")
+        print(r"\begin{table}[h]")
+        print(r"\caption{NER Span F1 Comparison}")
+        print(r"\begin{tabular}{lrrrr}")
+        print(r"\hline")
+        print(r"Model & Precision & Recall & F1 & Macro-F1 \\")
+        print(r"\hline")
+        for name, r in data.items():
+            short = name.replace("_", r"\_")
+            print(
+                f"{short} & {r.get('precision',0):.4f} & {r.get('recall',0):.4f} "
+                f"& {r.get('f1',0):.4f} & {r.get('macro_f1',0):.4f} \\\\"
+            )
+        print(r"\hline")
+        print(r"\end{tabular}")
+        print(r"\end{table}")
 
 
-def make_hallu_md(hallu_results: dict) -> str:
-    lines = []
-    lines.append("## TABLE 3: 환각 탐지 성능\n")
-    lines.append("| 시스템 | Accuracy | Precision | Recall | F1 | AUC-ROC | N |")
-    lines.append("|--------|----------|-----------|--------|----|---------|----|")
+# ── Table 2: NER 엔티티별 F1 ──────────────────────────────────────────────────
 
-    for sys_name, metrics in hallu_results.items():
-        row = (
-            f"| {sys_name} "
-            f"| {fmt(metrics.get('accuracy', 0.0))} "
-            f"| {fmt(metrics.get('precision', 0.0))} "
-            f"| {fmt(metrics.get('recall', 0.0))} "
-            f"| {fmt(metrics.get('f1', 0.0))} "
-            f"| {fmt(metrics.get('auc_roc', 0.0))} "
-            f"| {metrics.get('support', 0)} |"
+def table2_ner_per_entity(data: dict, latex: bool) -> None:
+    print("\n" + "=" * 70)
+    print("Table 2: NER 엔티티별 F1")
+    print("         [공동 엔티티] ORG / DATE / AMOUNT")
+    print("         [법률 전용]  LAW / CRIME / PENALTY")
+    print("=" * 70)
+
+    col_w = 9
+    header = f"{'모델':<40}" + "".join(f" {t:>{col_w}}" for t in ENTITY_TYPES)
+    print(header)
+    sep(40 + col_w * len(ENTITY_TYPES) + len(ENTITY_TYPES))
+
+    for name, r in data.items():
+        row = f"{name:<40}"
+        for t in ENTITY_TYPES:
+            val = r.get(f"f1_{t}", 0.0)
+            row += f" {val:>{col_w}.4f}"
+        print(row)
+
+    if latex:
+        print("\n[LaTeX]")
+        print(r"\begin{table}[h]")
+        print(r"\caption{Per-Entity F1 Score}")
+        print(r"\begin{tabular}{l" + "r" * len(ENTITY_TYPES) + "}")
+        print(r"\hline")
+        cols = " & ".join(ENTITY_TYPES)
+        print(f"Model & {cols} \\\\")
+        print(r"\hline")
+        for name, r in data.items():
+            short = name.replace("_", r"\_")
+            vals = " & ".join(f"{r.get(f'f1_{t}',0):.4f}" for t in ENTITY_TYPES)
+            print(f"{short} & {vals} \\\\")
+        print(r"\hline")
+        print(r"\end{tabular}")
+        print(r"\end{table}")
+
+
+# ── Table 3: RAG 검색 성능 ────────────────────────────────────────────────────
+
+def table3_rag(data: dict, latex: bool) -> None:
+    print("\n" + "=" * 70)
+    print("Table 3: RAG 검색 성능 비교")
+    print("=" * 70)
+
+    best_hit  = max(r.get("hit_at_1", 0) for r in data.values())
+    best_ndcg = max(r.get("ndcg_at_5", 0) for r in data.values())
+
+    header = f"{'방식':<15} {'Hit@1':>10} {'NDCG@5':>10} {'N':>6}"
+    print(header)
+    sep(45)
+    for name, r in data.items():
+        h = r.get("hit_at_1", 0)
+        n = r.get("ndcg_at_5", 0)
+        cnt = r.get("n", "-")
+        print(f"{name:<15} {bold(h, best_hit):>10} {bold(n, best_ndcg):>10} {cnt:>6}")
+
+    if latex:
+        print("\n[LaTeX]")
+        print(r"\begin{table}[h]")
+        print(r"\caption{RAG Retrieval Performance}")
+        print(r"\begin{tabular}{lrrl}")
+        print(r"\hline")
+        print(r"Method & Hit@1 & NDCG@5 & N \\")
+        print(r"\hline")
+        for name, r in data.items():
+            print(
+                f"{name} & {r.get('hit_at_1',0):.4f} & {r.get('ndcg_at_5',0):.4f} "
+                f"& {r.get('n', '-')} \\\\"
+            )
+        print(r"\hline")
+        print(r"\end{tabular}")
+        print(r"\end{table}")
+
+
+# ── Table 4: 환각 탐지 비교 ───────────────────────────────────────────────────
+
+def table4_hallucination(data: dict, latex: bool) -> None:
+    print("\n" + "=" * 70)
+    print("Table 4: 환각 탐지 성능 비교")
+    print("=" * 70)
+
+    numeric = {k: v for k, v in data.items() if "f1" in v}
+    if not numeric:
+        print("  (결과 없음)")
+        return
+
+    best_f1  = max(r["f1"] for r in numeric.values())
+    best_rec = max(r["recall"] for r in numeric.values())
+
+    header = f"{'모델':<25} {'Precision':>10} {'Recall':>8} {'F1':>8} {'Accuracy':>10}"
+    print(header)
+    sep(65)
+    for name, r in data.items():
+        if "note" in r:
+            print(f"{name:<25} {'(생략)'}")
+            continue
+        p   = r.get("precision", 0)
+        rec = r.get("recall", 0)
+        f1  = r.get("f1", 0)
+        acc = r.get("accuracy", 0)
+        print(
+            f"{name:<25} {p:>10.4f} {bold(rec, best_rec):>8} "
+            f"{bold(f1, best_f1):>8} {acc:>10.4f}"
         )
-        lines.append(row)
 
-    lines.append("")
-    lines.append("*binary classification: is_hallucination (positive=환각)*\n")
-    return "\n".join(lines)
-
-
-# ──────────────────────────────
-# LaTeX 표 생성
-# ──────────────────────────────
-
-def make_ner_tex(ner_results: dict) -> str:
-    entity_types = ["LAW", "ORG", "DATE", "AMOUNT", "CRIME", "PENALTY"]
-
-    lines = [
-        r"\begin{table}[ht]",
-        r"\centering",
-        r"\caption{NER 개체명 인식 성능 (Entity-level Span F1)}",
-        r"\label{tab:ner}",
-        r"\resizebox{\textwidth}{!}{",
-        r"\begin{tabular}{lcccccccc}",
-        r"\toprule",
-        r"모델 & LAW & ORG & DATE & AMOUNT & CRIME & PENALTY & Macro F1 & Overall F1 \\",
-        r"\midrule",
-    ]
-
-    for model_key, result in ner_results.items():
-        pe = result.get("per_entity", {})
-        vals = [pe.get(t, {}).get("f1", 0.0) for t in entity_types]
-        macro = result.get("macro_f1", 0.0)
-        overall = result.get("overall", {}).get("f1", 0.0)
-        cells = " & ".join([fmt(v) for v in vals] + [fmt(macro), fmt(overall)])
-        lines.append(f"{model_key} & {cells} \\\\")
-
-    lines += [
-        r"\bottomrule",
-        r"\end{tabular}",
-        r"}",
-        r"\end{table}",
-        "",
-    ]
-    return "\n".join(lines)
+    if latex:
+        print("\n[LaTeX]")
+        print(r"\begin{table}[h]")
+        print(r"\caption{Hallucination Detection Performance}")
+        print(r"\begin{tabular}{lrrrr}")
+        print(r"\hline")
+        print(r"Model & Precision & Recall & F1 & Accuracy \\")
+        print(r"\hline")
+        for name, r in data.items():
+            if "note" in r:
+                continue
+            short = name.replace("_", r"\_")
+            print(
+                f"{short} & {r.get('precision',0):.4f} & {r.get('recall',0):.4f} "
+                f"& {r.get('f1',0):.4f} & {r.get('accuracy',0):.4f} \\\\"
+            )
+        print(r"\hline")
+        print(r"\end{tabular}")
+        print(r"\end{table}")
 
 
-def make_rag_tex(rag_results: dict) -> str:
-    lines = [
-        r"\begin{table}[ht]",
-        r"\centering",
-        r"\caption{RAG 검색 성능}",
-        r"\label{tab:rag}",
-        r"\begin{tabular}{lcccccc}",
-        r"\toprule",
-        r"시스템 & Hit@1 & Hit@5 & Hit@10 & MRR@10 & NDCG@10 & N \\",
-        r"\midrule",
-    ]
+# ── Table 5: Ablation ─────────────────────────────────────────────────────────
 
-    for sys_name, metrics in rag_results.items():
-        cells = " & ".join([
-            fmt(metrics.get("hit@1", 0.0)),
-            fmt(metrics.get("hit@5", 0.0)),
-            fmt(metrics.get("hit@10", 0.0)),
-            fmt(metrics.get("mrr@10", 0.0)),
-            fmt(metrics.get("ndcg@10", 0.0)),
-            str(metrics.get("n", 0)),
-        ])
-        lines.append(f"{sys_name} & {cells} \\\\")
+def table5_ablation(data: dict, latex: bool) -> None:
+    print("\n" + "=" * 70)
+    print("Table 5: Ablation Study")
+    print("         (환각 탐지 파이프라인 단계별 기여도)")
+    print("=" * 70)
 
-    lines += [
-        r"\bottomrule",
-        r"\end{tabular}",
-        r"\end{table}",
-        "",
-    ]
-    return "\n".join(lines)
+    label_map = {
+        "A_no_rag":     "A: RAG 없음",
+        "B_rag":        "B: RAG",
+        "C_rag_sim":    "C: RAG + SIM",
+        "D_rag_sim_ner": "D: RAG + SIM + NER",
+    }
 
+    best_f1 = max(r.get("f1", 0) for r in data.values())
 
-def make_hallu_tex(hallu_results: dict) -> str:
-    lines = [
-        r"\begin{table}[ht]",
-        r"\centering",
-        r"\caption{환각 탐지 성능}",
-        r"\label{tab:hallucination}",
-        r"\begin{tabular}{lcccccc}",
-        r"\toprule",
-        r"시스템 & Accuracy & Precision & Recall & F1 & AUC-ROC & N \\",
-        r"\midrule",
-    ]
+    header = f"{'조건':<22} {'Precision':>10} {'Recall':>8} {'F1':>8} {'Accuracy':>10}"
+    print(header)
+    sep(62)
+    for key, label in label_map.items():
+        if key not in data:
+            continue
+        r = data[key]
+        p   = r.get("precision", 0)
+        rec = r.get("recall", 0)
+        f1  = r.get("f1", 0)
+        acc = r.get("accuracy", 0)
+        print(
+            f"{label:<22} {p:>10.4f} {rec:>8.4f} "
+            f"{bold(f1, best_f1):>8} {acc:>10.4f}"
+        )
 
-    for sys_name, metrics in hallu_results.items():
-        cells = " & ".join([
-            fmt(metrics.get("accuracy", 0.0)),
-            fmt(metrics.get("precision", 0.0)),
-            fmt(metrics.get("recall", 0.0)),
-            fmt(metrics.get("f1", 0.0)),
-            fmt(metrics.get("auc_roc", 0.0)),
-            str(metrics.get("support", 0)),
-        ])
-        lines.append(f"{sys_name} & {cells} \\\\")
-
-    lines += [
-        r"\bottomrule",
-        r"\end{tabular}",
-        r"\end{table}",
-        "",
-    ]
-    return "\n".join(lines)
+    if latex:
+        print("\n[LaTeX]")
+        print(r"\begin{table}[h]")
+        print(r"\caption{Ablation Study}")
+        print(r"\begin{tabular}{lrrrr}")
+        print(r"\hline")
+        print(r"Condition & Precision & Recall & F1 & Accuracy \\")
+        print(r"\hline")
+        for key, label in label_map.items():
+            if key not in data:
+                continue
+            r = data[key]
+            print(
+                f"{label} & {r.get('precision',0):.4f} & {r.get('recall',0):.4f} "
+                f"& {r.get('f1',0):.4f} & {r.get('accuracy',0):.4f} \\\\"
+            )
+        print(r"\hline")
+        print(r"\end{tabular}")
+        print(r"\end{table}")
 
 
-def main() -> None:
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+# ── 메인 ──────────────────────────────────────────────────────────────────────
 
-    ner_results = load_json(RESULTS_DIR / "ner_results.json")
-    rag_results = load_json(RESULTS_DIR / "rag_results.json")
-    hallu_results = load_json(RESULTS_DIR / "hallucination_results.json")
+def main(latex: bool = False) -> None:
+    ner_data    = load_json(NER_RESULTS_PATH)
+    rag_data    = load_json(RAG_RESULTS_PATH)
+    hallu_data  = load_json(HALLU_RESULTS_PATH)
+    ablation_data = load_json(ABLATION_RESULTS_PATH)
 
-    missing = []
-    if not ner_results:
-        missing.append("ner_results.json (evaluate_ner.py 실행 필요)")
-    if not rag_results:
-        missing.append("rag_results.json (evaluate_rag.py 실행 필요)")
-    if not hallu_results:
-        missing.append("hallucination_results.json (evaluate_hallucination.py 실행 필요)")
+    if ner_data:
+        table1_ner_overall(ner_data, latex)
+        table2_ner_per_entity(ner_data, latex)
+    else:
+        print("\n[Table 1/2 생략] eval_ner_compare.py 먼저 실행하세요.")
 
-    if missing:
-        print("[WARN] 다음 결과 파일이 없습니다:")
-        for m in missing:
-            print(f"  - {m}")
-        print("사용 가능한 결과만 표를 생성합니다.\n")
+    if rag_data:
+        table3_rag(rag_data, latex)
+    else:
+        print("\n[Table 3 생략] evaluate_rag.py 먼저 실행하세요.")
 
-    # ── Markdown ──
-    md_sections = ["# LawsGuard 성능 평가 결과\n"]
-    if ner_results:
-        md_sections.append(make_ner_md(ner_results))
-    if rag_results:
-        md_sections.append(make_rag_md(rag_results))
-    if hallu_results:
-        md_sections.append(make_hallu_md(hallu_results))
+    if hallu_data:
+        table4_hallucination(hallu_data, latex)
+    else:
+        print("\n[Table 4 생략] evaluate_hallucination.py 먼저 실행하세요.")
 
-    OUT_FILE_MD.write_text("\n".join(md_sections), encoding="utf-8")
-    print(f"Markdown 저장: {OUT_FILE_MD}")
+    if ablation_data:
+        table5_ablation(ablation_data, latex)
+    else:
+        print("\n[Table 5 생략] evaluate_hallucination.py (--ablation) 먼저 실행하세요.")
 
-    # ── LaTeX ──
-    tex_sections = [
-        r"% LawsGuard 성능 평가 결과",
-        r"\usepackage{booktabs}",
-        r"\usepackage{graphicx}",
-        "",
-    ]
-    if ner_results:
-        tex_sections.append(make_ner_tex(ner_results))
-    if rag_results:
-        tex_sections.append(make_rag_tex(rag_results))
-    if hallu_results:
-        tex_sections.append(make_hallu_tex(hallu_results))
-
-    OUT_FILE_TEX.write_text("\n".join(tex_sections), encoding="utf-8")
-    print(f"LaTeX 저장: {OUT_FILE_TEX}")
-
-    # ── 통합 JSON ──
-    summary = {}
-    if ner_results:
-        summary["ner"] = ner_results
-    if rag_results:
-        summary["rag"] = rag_results
-    if hallu_results:
-        summary["hallucination"] = hallu_results
-
-    OUT_FILE_JSON.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"통합 JSON 저장: {OUT_FILE_JSON}")
-
-    # ── 콘솔 요약 ──
-    print("\n" + "=" * 60)
-    print("논문용 표 생성 완료")
-    print("=" * 60)
-    if ner_results:
-        best_ner = max(ner_results.items(), key=lambda x: x[1].get("macro_f1", 0))
-        print(f"최고 NER 모델: {best_ner[0]} (macro F1={best_ner[1].get('macro_f1', 0):.3f})")
-    if rag_results:
-        best_rag = max(rag_results.items(), key=lambda x: x[1].get("mrr@10", 0))
-        print(f"최고 RAG 시스템: {best_rag[0]} (MRR@10={best_rag[1].get('mrr@10', 0):.3f})")
-    if hallu_results:
-        best_hallu = max(hallu_results.items(), key=lambda x: x[1].get("f1", 0))
-        print(f"최고 환각탐지 시스템: {best_hallu[0]} (F1={best_hallu[1].get('f1', 0):.3f})")
+    print("\n" + "=" * 70)
+    print("완료. * 표시는 각 표에서 최고 성능.")
+    print("=" * 70)
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--latex", action="store_true", help="LaTeX 표 추가 출력")
+    args = parser.parse_args()
+    main(latex=args.latex)
