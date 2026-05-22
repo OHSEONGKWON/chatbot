@@ -555,10 +555,13 @@ class ClarificationManager:
             "직장 내 괴롭힘",
             "산재",
         ):
-            has_subject = entity_check.get("subject") or self._has_context_signal(context, "subject")
-            has_timing = entity_check.get("timing") or self._has_context_signal(context, "timing")
+            # 노동 사안은 LLM이 목적/주체를 과하게 낙관적으로 채우는 경우가 있어,
+            # 실제 질문 문장에 드러난 신호만 기준으로 재질문 여부를 판단한다.
+            has_subject = self._has_context_signal(context, "subject")
+            has_timing = self._has_context_signal(context, "timing")
             has_evidence = self._has_context_signal(context, "evidence")
-            return not (has_action and (has_purpose or has_subject or has_timing or has_evidence))
+            context_purpose = self._has_context_signal(context, "purpose") or self._has_obvious_purpose(context)
+            return not (has_action and (context_purpose or has_subject or has_timing or has_evidence))
 
         strong_issue = self._has_strong_issue_signal(context)
 

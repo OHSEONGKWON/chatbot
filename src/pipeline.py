@@ -23,6 +23,7 @@ from .modules.rag import retriever
 from .session_store import session_store
 from .config import config
 from .evaluation import evaluate_pipeline_output, EvaluationResult
+from .chat_history import chat_history
 
 
 @dataclass
@@ -171,6 +172,11 @@ class LawsGuardPipeline:
             issue_plan=issue_plan,
         )
 
+        try:
+            past_history = chat_history.get_recent_by_category(user_id, legal_category, limit=5)
+        except Exception:
+            past_history = []
+
         is_reliable, original_answer, avg_score, _ = await self._consistency.run(
             final_question,
             rag_docs=rag_docs,
@@ -178,6 +184,7 @@ class LawsGuardPipeline:
             case_frame=case_frame,
             issue_plan=issue_plan,
             answer_contract=answer_contract,
+            past_history=past_history,
         )
         quality_report = self._build_quality_report(extra={
             "RRS": rrs_report,
@@ -280,6 +287,21 @@ class LawsGuardPipeline:
         }
 
         session_store.delete(user_id)
+
+        try:
+            chat_history.save(
+                user_id=user_id,
+                question=final_question,
+                answer=final_response,
+                legal_category=legal_category,
+                step_reached=7,
+                answer_reliability=answer_reliability,
+                qafs=final_contract_check.score,
+                rrs=rrs_report.get("score"),
+            )
+        except Exception:
+            pass
+
         return PipelineResult(
             response_text=general_prefix + final_response,
             needs_requery=False,
