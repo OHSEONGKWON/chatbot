@@ -31,8 +31,9 @@ from src.modules.rag import retriever
 
 # ── 파일 경로 ─────────────────────────────────────────────────────────────────
 EVAL_FILES = {
-    "bio":    REPO_ROOT / "data" / "evaluation" / "rag_eval.jsonl",
-    "golden": REPO_ROOT / "data" / "evaluation" / "golden_candidates.jsonl",
+    "bio":      REPO_ROOT / "data" / "evaluation" / "rag_eval.jsonl",
+    "remapped": REPO_ROOT / "data" / "evaluation" / "rag_eval_remapped.jsonl",
+    "golden":   REPO_ROOT / "data" / "evaluation" / "golden_candidates.jsonl",
 }
 RESULTS_DIR = REPO_ROOT / "results"
 
@@ -65,9 +66,23 @@ def _ndcg_at_k(retrieved_ids: list[str], golden_rel: dict[str, int], k: int) -> 
 
 # ── 데이터 로더 ───────────────────────────────────────────────────────────────
 
-def _load_bio(path: Path, skip_zero: bool) -> list[dict[str, Any]]:
+_LABOR_KW  = ["임금", "근로", "해고", "노동", "최저임금", "퇴직", "알바", "계약서", "주휴"]
+_SEXUAL_KW = ["성폭력", "성희롱", "강제추행", "불법촬영", "성범죄", "추행"]
+
+
+def _infer_domain(query: str, positive_text: str) -> str:
+    text = query + " " + positive_text
+    if any(k in text for k in _LABOR_KW):
+        return "노동"
+    if any(k in text for k in _SEXUAL_KW):
+        return "성폭력"
+    return "기타"
+
+
+def _load_bio(path: Path, skip_zero: bool, domain_filter: bool = False) -> list[dict[str, Any]]:
     """positive_chunk_id 형식 로드 → 내부 표준 형식으로 변환."""
     items = []
+    skipped_domain = 0
     with path.open("r", encoding="utf-8") as f:
         for line in f:
             row = json.loads(line.strip())
@@ -75,16 +90,22 @@ def _load_bio(path: Path, skip_zero: bool) -> list[dict[str, Any]]:
                 continue
             if skip_zero and row.get("positive_relevance", 1) == 0:
                 continue
-            rel = row.get("positive_relevance", 1)
+            rel    = row.get("positive_relevance", 1)
+            query  = row["query"]
+            domain = _infer_domain(query, row.get("positive_text", ""))
+            if domain_filter and domain == "기타":
+                skipped_domain += 1
+                continue
             items.append({
-                "id":       row.get("query_id", ""),
-                "query":    row["query"],
-                "category": row.get("category", ""),
-                "source":   row.get("source_file", ""),
-                # 단일 정답 → dict 형식으로 통일
+                "id":             row.get("query_id", ""),
+                "query":          query,
+                "category":       row.get("category", "") or domain,
+                "source":         row.get("source_file", ""),
                 "golden_doc_ids": {row["positive_chunk_id"]: max(1, rel)},
-                "format": "bio",
+                "format":         "bio",
             })
+    if skipped_domain:
+        print(f"  [domain_filter] 기타 도메인 {skipped_domain}개 제외")
     return items
 
 
@@ -263,12 +284,14 @@ def _print_failures(results: list[dict], k: int = 10) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--eval", choices=["bio", "golden"], default="bio",
-                        help="평가셋 선택: bio=rag_eval.jsonl, golden=golden_candidates.jsonl")
+    parser.add_argument("--eval", choices=["bio", "remapped", "golden"], default="remapped",
+                        help="평가셋 선택: remapped=재매핑 완료(권장), bio=원본, golden=수동레이블")
     parser.add_argument("--top-k", type=int, default=10,
                         help="검색 범위 (기본값: 10)")
     parser.add_argument("--skip-zero", action="store_true",
                         help="relevance=0 항목 제외")
+    parser.add_argument("--domain-filter", action="store_true",
+                        help="노동/성폭력 외 도메인 제외 (bio/remapped 전용)")
     parser.add_argument("--save", action="store_true",
                         help="results/ 폴더에 JSON 저장")
     args = parser.parse_args()
@@ -280,10 +303,10 @@ def main() -> None:
 
     print(f"평가셋 : {eval_path.name}  (--eval {args.eval})")
     print(f"top_k  : {args.top_k}")
-    print(f"skip_zero: {args.skip_zero}")
+    print(f"skip_zero: {args.skip_zero}  domain_filter: {args.domain_filter}")
 
-    if args.eval == "bio":
-        items = _load_bio(eval_path, args.skip_zero)
+    if args.eval in ("bio", "remapped"):
+        items = _load_bio(eval_path, args.skip_zero, domain_filter=args.domain_filter)
     else:
         items = _load_golden(eval_path, args.skip_zero)
 
