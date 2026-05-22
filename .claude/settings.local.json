@@ -16,7 +16,14 @@
       "PowerShell(python -c \"import dotenv; print\\('ok'\\)\" 2>&1)",
       "PowerShell(python scripts/llm_label_golden.py 2>&1)",
       "PowerShell(python scripts/llm_label_golden.py --reset 2>&1)",
-      "PowerShell(python scripts/evaluate_rag_comprehensive.py --eval golden_reviewed --skip-zero 2>&1)"
+      "PowerShell(python scripts/evaluate_rag_comprehensive.py --eval golden_reviewed --skip-zero 2>&1)",
+      "PowerShell(python -c \"from sentence_transformers import CrossEncoder; print\\('CrossEncoder available'\\)\" 2>&1)",
+      "PowerShell(pip install sentence-transformers 2>&1)",
+      "PowerShell(python -c \"from sentence_transformers import CrossEncoder; print\\('OK'\\)\" 2>&1)",
+      "PowerShell(python scripts/evaluate_rag_comprehensive.py --eval golden_reviewed --skip-zero --compare --save 2>&1)",
+      "PowerShell(python scripts/evaluate_rag_comprehensive.py --eval golden_reviewed --skip-zero --compare --rerank-model \"cross-encoder/ms-marco-MiniLM-L-6-v2\" 2>&1)",
+      "PowerShell(python scripts/evaluate_rag_comprehensive.py --eval golden_reviewed --skip-zero --compare --rerank-model \"Dongjin-kr/ko-reranker\" 2>&1)",
+      "PowerShell(python scripts/evaluate_rag_comprehensive.py --eval golden_reviewed --skip-zero --compare --rerank-model llm --save 2>&1)"
     ]
   }
 }

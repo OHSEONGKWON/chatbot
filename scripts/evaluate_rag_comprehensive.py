@@ -149,7 +149,20 @@ def _retrieved_ids(docs: list[dict[str, Any]]) -> list[str]:
 
 # ── 평가 실행 ─────────────────────────────────────────────────────────────────
 
-def evaluate(items: list[dict[str, Any]], top_k: int) -> dict[str, Any]:
+def evaluate(
+    items: list[dict[str, Any]],
+    top_k: int,
+    rerank: bool = False,
+    rerank_model: str = "",
+) -> dict[str, Any]:
+    _reranker = None
+    if rerank:
+        if rerank_model == "llm":
+            from src.modules.reranker import llm_reranker as _reranker
+        else:
+            from src.modules.reranker import CrossEncoderReranker
+            _reranker = CrossEncoderReranker(rerank_model or "bongsoo/klue-cross-encoder-v1")
+
     results = []
     mismatch_count = 0
 
@@ -158,7 +171,10 @@ def evaluate(items: list[dict[str, Any]], top_k: int) -> dict[str, Any]:
         category = item["category"]
         golden   = item["golden_doc_ids"]  # {chunk_id: rel}
 
-        docs = retriever.retrieve(query, top_k=top_k, legal_category=category)
+        fetch_k = top_k * 2 if rerank else top_k
+        docs = retriever.retrieve(query, top_k=fetch_k, legal_category=category)
+        if rerank and _reranker:
+            docs = _reranker.rerank(query, docs, top_k=top_k)
         ret_ids = _retrieved_ids(docs)
 
         # 정규화 버전(part suffix 제거)으로도 매칭
@@ -296,6 +312,12 @@ def main() -> None:
                         help="relevance=0 항목 제외")
     parser.add_argument("--domain-filter", action="store_true",
                         help="노동/성폭력 외 도메인 제외 (bio/remapped 전용)")
+    parser.add_argument("--rerank", action="store_true",
+                        help="Cross-Encoder Reranker 적용 (Before/After 비교 시 두 번 실행)")
+    parser.add_argument("--compare", action="store_true",
+                        help="Before/After 한 번에 비교 출력 (--rerank 포함)")
+    parser.add_argument("--rerank-model", type=str, default="bongsoo/klue-cross-encoder-v1",
+                        help="Cross-Encoder 모델명")
     parser.add_argument("--save", action="store_true",
                         help="results/ 폴더에 JSON 저장")
     args = parser.parse_args()
@@ -316,7 +338,46 @@ def main() -> None:
 
     print(f"로드된 케이스: {len(items)}개\n검색 중...")
 
-    output  = evaluate(items, top_k=args.top_k)
+    do_compare = args.compare or (args.rerank and not args.compare)
+
+    if do_compare:
+        # Before
+        print("[ Before: retriever only ]")
+        out_before = evaluate(items, top_k=args.top_k, rerank=False)
+
+        label = "LLM (Claude Haiku)" if args.rerank_model == "llm" else args.rerank_model
+        print(f"\n[ After: + Reranker ({label}) ]")
+        out_after = evaluate(items, top_k=args.top_k, rerank=True, rerank_model=args.rerank_model)
+
+        s_before = out_before.get("summary", {})
+        s_after  = out_after.get("summary", {})
+        print(f"\n{'='*60}")
+        print(f"Before vs After  (n={s_before.get('n', 0)})")
+        print(f"{'='*60}")
+        print(f"{'메트릭':<10}  {'Before':>8}  {'After':>8}  {'Delta':>8}")
+        print(f"{'-'*42}")
+        for key in ("hit@1", "hit@3", "hit@5", "mrr", "ndcg@5"):
+            b = s_before.get(key, 0.0)
+            a = s_after.get(key, 0.0)
+            delta = a - b
+            sign = "+" if delta >= 0 else ""
+            print(f"{key:<10}  {b:>8.4f}  {a:>8.4f}  {sign}{delta:>7.4f}")
+        print(f"{'='*60}\n")
+
+        summary = s_after
+        results = out_after.get("results", [])
+        breakdown = breakdown_by_category(results)
+
+        if args.save:
+            RESULTS_DIR.mkdir(exist_ok=True)
+            for tag, out in (("before", out_before), ("after", out_after)):
+                out_path = RESULTS_DIR / f"rag_metrics_{args.eval}_{tag}.json"
+                with out_path.open("w", encoding="utf-8") as f:
+                    json.dump(out, f, ensure_ascii=False, indent=2)
+                print(f"저장: {out_path}")
+        return
+
+    output  = evaluate(items, top_k=args.top_k, rerank=args.rerank, rerank_model=args.rerank_model)
     summary = output.get("summary", {})
     results = output.get("results", [])
 
@@ -330,7 +391,8 @@ def main() -> None:
 
     if args.save:
         RESULTS_DIR.mkdir(exist_ok=True)
-        out_path = RESULTS_DIR / f"rag_metrics_{args.eval}.json"
+        suffix = "_reranked" if args.rerank else ""
+        out_path = RESULTS_DIR / f"rag_metrics_{args.eval}{suffix}.json"
         with out_path.open("w", encoding="utf-8") as f:
             json.dump({"summary": summary, "breakdown": breakdown, "results": results},
                       f, ensure_ascii=False, indent=2)
