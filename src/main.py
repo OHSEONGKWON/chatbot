@@ -40,10 +40,13 @@ async def lifespan(app: FastAPI):
 
 
 async def _session_cleanup_loop():
-    while True:
-        await asyncio.sleep(1800)
-        session_store.cleanup_expired()
-        logger.info("만료 세션 정리 완료")
+    try:
+        while True:
+            await asyncio.sleep(1800)
+            session_store.cleanup_expired()
+            logger.info("만료 세션 정리 완료")
+    except asyncio.CancelledError:
+        logger.info("세션 정리 태스크 종료")
 
 
 async def _warmup_components():
@@ -74,6 +77,7 @@ async def send_callback(
         payload = build_text_and_image_response(response_text, image_url, quick_replies=quick_replies)
     else:
         payload = build_simple_text(response_text, quick_replies=quick_replies)
+        
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
             resp = await client.post(callback_url, json=payload)
@@ -90,29 +94,30 @@ async def send_callback(
 
 async def run_pipeline_and_callback(user_id: str, user_input: str, callback_url: str):
     start = time.monotonic()
-    webtoon_task = asyncio.create_task(generate_webtoon(user_input))
+    
     try:
+        # 1. RAG 파이프라인부터 먼저 실행하여 '답변'을 완전히 얻어냅니다. (제한 시간 없음)
         result = await pipeline.process(user_id=user_id, user_input=user_input)
-        elapsed = time.monotonic() - start
-
+        
         image_url = None
+        
+        # 2. 재질의가 필요 없는 정상 답변인 경우, 얻어낸 '답변'을 기반으로 웹툰 생성을 시도합니다.
         if not result.needs_requery:
-            remain_for_webtoon = max(0.0, CALLBACK_TOKEN_SAFETY_SEC - elapsed - 2.0)
-            if remain_for_webtoon > 0:
-                try:
-                    filename = await asyncio.wait_for(webtoon_task, timeout=remain_for_webtoon)
-                    if filename:
-                        image_url = f"{config.kakao.server_url}/images/{filename}"
-                except asyncio.TimeoutError:
-                    logger.warning("콜백 안전시간 내 웹툰 생성 미완료 — 이번 턴은 텍스트만 전송")
-            else:
-                logger.warning("콜백 안전시간 부족 — 이번 턴은 텍스트만 전송")
+            logger.info("답변 기반 웹툰 생성을 시작합니다... (시간 제한 없음)")
+            # 주의: user_input이 아니라 result.response_text(생성된 AI 답변)을 넘깁니다.
+            filename = await generate_webtoon(result.response_text)
+            
+            if filename:
+                image_url = f"{config.kakao.server_url}/images/{filename}"
 
+        elapsed_total = time.monotonic() - start
         logger.info(
             f"파이프라인 완료 | user={user_id[:8]}... | step={result.step_reached} | "
             f"reliability={(f'{result.answer_reliability:.3f}' if result.answer_reliability is not None else 'N/A')} | "
-            f"time={elapsed:.2f}s"
+            f"총 소요시간={elapsed_total:.2f}s"
         )
+        
+        # 3. 완성된 글과 그림을 카카오톡 콜백으로 전송합니다.
         callback_ok = await send_callback(
             callback_url,
             result.response_text,
@@ -121,15 +126,13 @@ async def run_pipeline_and_callback(user_id: str, user_input: str, callback_url:
             image_url=image_url,
         )
 
+        # 60초가 넘어가면 여기서 전송 실패 로그가 뜰 확률이 높습니다.
         if not callback_ok:
-            logger.warning("콜백 실패 — callback token 만료 가능성이 높습니다.")
+            logger.error(f"콜백 전송 실패! (소요시간: {elapsed_total:.1f}초) - 카카오의 60초 제한을 초과하여 토큰이 만료되었을 가능성이 높습니다.")
 
     except Exception as e:
         logger.exception(f"파이프라인 오류: {e}")
         await send_callback(callback_url, "죄송합니다. 처리 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.")
-    finally:
-        if not webtoon_task.done():
-            webtoon_task.cancel()
 
 
 @app.post("/webhook/kakao")

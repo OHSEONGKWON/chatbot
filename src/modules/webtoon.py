@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import logging
 import os
+import re  # 정규표현식 모듈 추가
 from pathlib import Path
 
 import httpx
@@ -38,20 +39,47 @@ def _sanitize(text: str) -> str:
     return text
 
 
-def _build_image_prompt(question: str) -> str:
-    safe_question = _sanitize(question)
+def _extract_specific_points(text: str) -> dict[int, str]:
+    """답변 텍스트에서 숫자 리스트(1., 2) 등)로 시작하는 줄을 찾아 딕셔너리로 반환합니다."""
+    points = {}
+    # 매칭 패턴: 공백(선택) + 숫자 + 괄호나 점 + 내용 (예: " 1. 내용증명", "2) 고소장")
+    pattern = re.compile(r'^\s*\[?(\d+)[\]\.\)]\s*(.*)')
+    
+    for line in text.split('\n'):
+        match = pattern.match(line)
+        if match:
+            num = int(match.group(1))
+            points[num] = match.group(2)
+            
+    return points
+
+
+def _build_image_prompt(answer_text: str) -> str:
+    safe_text = _sanitize(answer_text)
+    
+    # AI 답변에서 1, 2, 4, 5번 추출 (만약 해당 번호가 없을 경우를 대비해 기본값 설정)
+    points = _extract_specific_points(safe_text)
+    p1 = points.get(1, "상황 발생 및 기초 사실관계 확인")
+    p2 = points.get(2, "관련 증거 수집 및 법적 검토")
+    p4 = points.get(4, "구체적인 기관 대응 및 절차 진행")
+    p5 = points.get(5, "최종 사건 해결 및 권리 회복")
+    
     character = "20대 한국인 주인공, 단정한 캐주얼 복장, 4컷 동일한 외모 유지"
+    
+    # 추출한 답변 내용을 각 패널에 직접 주입합니다.
     combined = (
-        "[패널 1] 상담 상황 시작, 사용자가 고민을 털어놓는 장면 | 상단 배너: \"상황 발생\" | 하단 박스: \"사실관계 정리\"\n"
-        "[패널 2] 주인공이 침착하게 증거/기록을 확인하는 장면 | 상단 배너: \"핵심 확인\" | 하단 박스: \"증거를 모아요\"\n"
-        "[패널 3] 상담/신고 창구를 찾는 장면 | 상단 배너: \"대응 준비\" | 하단 박스: \"기관에 문의\"\n"
-        "[패널 4] 절차를 진행하며 안도하는 장면 | 상단 배너: \"해결 단계\" | 하단 박스: \"권리 보호 시작\""
+        f"[패널 1] 묘사 내용: {p1} | 상단 배너: \"1단계\" | 하단 박스: \"답변 1번 내용\"\n"
+        f"[패널 2] 묘사 내용: {p2} | 상단 배너: \"2단계\" | 하단 박스: \"답변 2번 내용\"\n"
+        f"[패널 3] 묘사 내용: {p4} | 상단 배너: \"4단계\" | 하단 박스: \"답변 4번 내용\"\n"
+        f"[패널 4] 묘사 내용: {p5} | 상단 배너: \"5단계\" | 하단 박스: \"답변 5번 내용\""
     )
+    
     return (
         f"한국 웹툰 스타일 2×2 그리드 4컷 만화. 법률 교육 목적.\n\n"
         f"【주인공 외모 — 4컷 전체 동일 유지】 {character}\n\n"
-        f"【사용자 상담 요약】 {safe_question}\n\n"
-        f"【패널 배치】 좌상단(1컷) → 우상단(2컷) → 좌하단(3컷) → 우하단(4컷), 얇은 구분선\n\n"
+        f"【전체 문맥 참고용 원본 답변】\n{safe_text}\n\n"
+        f"【패널 구성 - 답변의 1, 2, 4, 5번 항목만 집중 묘사할 것】\n"
+        f"좌상단(1컷) → 우상단(2컷) → 좌하단(3컷) → 우하단(4컷), 얇은 구분선\n"
         f"{combined}\n\n"
         f"【아트 스타일】\n"
         f"- 전문 웹툰/만화 퀄리티, 굵은 검은 외곽선, 선명한 플랫 셀 채색\n"
@@ -62,7 +90,7 @@ def _build_image_prompt(question: str) -> str:
     )
 
 
-async def generate_webtoon(question: str) -> str | None:
+async def generate_webtoon(answer_text: str) -> str | None:
     """법률 상담 내용으로 4컷 웹툰을 생성하고 저장된 파일명을 반환합니다. 실패 시 None."""
     from openai import AsyncOpenAI
 
@@ -74,7 +102,8 @@ async def generate_webtoon(question: str) -> str | None:
     client = AsyncOpenAI(api_key=api_key)
 
     try:
-        image_prompt = _build_image_prompt(question)
+        image_prompt = _build_image_prompt(answer_text)
+        # 요청하신 대로 모델명(gpt-image-2) 등 기존 설정은 그대로 유지했습니다.
         img_resp = await client.images.generate(
             model="gpt-image-2",
             prompt=image_prompt,
@@ -83,6 +112,7 @@ async def generate_webtoon(question: str) -> str | None:
             output_format="jpeg",
             n=1,
         )
+        
         img = img_resp.data[0]
         if getattr(img, "b64_json", None):
             image_bytes = base64.b64decode(img.b64_json)
