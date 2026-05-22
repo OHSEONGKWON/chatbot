@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(Head -20)",
+      "PowerShell(Get-Content \"c:\\\\chatbot\\\\data\\\\real_data\\\\New_Dataset\\\\rag_law_chunks.jsonl\" -TotalCount 3 | ForEach-Object { $_ | ConvertFrom-Json | Select-Object chunk_id, @{N='text_preview';E={$_.text.Substring\\(0, [Math]::Min\\(80, $_.text.Length\\)\\)}}, metadata } | ConvertTo-Json)",
+      "PowerShell(Get-Content \"c:\\\\chatbot\\\\data\\\\real_data\\\\New_Dataset\\\\rag_manual_chunks.jsonl\" -TotalCount 3 | ForEach-Object { $_ | ConvertFrom-Json | Select-Object chunk_id, @{N='text_preview';E={$_.text.Substring\\(0, [Math]::Min\\(80, $_.text.Length\\)\\)}}, metadata } | ConvertTo-Json)",
+      "PowerShell(git -C c:\\\\chatbot status)",
+      "Skill(claude-api)",
+      "Skill(claude-api:*)",
+      "PowerShell(Get-Content \"c:\\\\Users\\\\CHO\\\\OneDrive\\\\문서\\\\GitHub\\\\chatbot\\\\data\\\\evaluation\\\\golden_candidates.jsonl\" | Select-Object -First 3 | ForEach-Object { $_ | ConvertFrom-Json | ConvertTo-Json -Depth 5 })",
+      "PowerShell(python scripts/evaluate_rag_comprehensive.py --help 2>&1)",
+      "PowerShell(python scripts/llm_label_golden.py --dry-run 2>&1)",
+      "PowerShell(pip install anthropic 2>&1)",
+      "PowerShell(python -c \"import anthropic; print\\(anthropic.__version__\\)\" 2>&1)",
+      "PowerShell(python -c \"import os; key = os.environ.get\\('ANTHROPIC_API_KEY', ''\\); print\\('Key set:', bool\\(key\\), '| prefix:', key[:8] if key else 'NONE'\\)\" 2>&1)",
+      "PowerShell(python -c \"import dotenv; print\\('ok'\\)\" 2>&1)",
+      "PowerShell(python scripts/llm_label_golden.py 2>&1)",
+      "PowerShell(python scripts/llm_label_golden.py --reset 2>&1)",
+      "PowerShell(python scripts/evaluate_rag_comprehensive.py --eval golden_reviewed --skip-zero 2>&1)",
+      "PowerShell(python -c \"from sentence_transformers import CrossEncoder; print\\('CrossEncoder available'\\)\" 2>&1)",
+      "PowerShell(pip install sentence-transformers 2>&1)",
+      "PowerShell(python -c \"from sentence_transformers import CrossEncoder; print\\('OK'\\)\" 2>&1)",
+      "PowerShell(python scripts/evaluate_rag_comprehensive.py --eval golden_reviewed --skip-zero --compare --save 2>&1)",
+      "PowerShell(python scripts/evaluate_rag_comprehensive.py --eval golden_reviewed --skip-zero --compare --rerank-model \"cross-encoder/ms-marco-MiniLM-L-6-v2\" 2>&1)",
+      "PowerShell(python scripts/evaluate_rag_comprehensive.py --eval golden_reviewed --skip-zero --compare --rerank-model \"Dongjin-kr/ko-reranker\" 2>&1)",
+      "PowerShell(python scripts/evaluate_rag_comprehensive.py --eval golden_reviewed --skip-zero --compare --rerank-model llm --save 2>&1)"
+    ]
+  }
+}

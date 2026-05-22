@@ -6,6 +6,7 @@ import os
 import re
 import statistics
 from collections import OrderedDict
+from datetime import datetime
 from difflib import SequenceMatcher
 from typing import Any
 
@@ -247,14 +248,72 @@ class ConsistencyChecker:
             blocks.append(f"[{i}] {title} ({source_type}) {reason}\n{text[:1200]}")
         return "\n\n".join(blocks)
 
-    async def _generate_single_answer(self, question: str, rag_docs: list[dict[str, Any]], category: str = "", case_frame: Any | None = None, issue_plan: Any | None = None, answer_contract: Any | None = None) -> str:
+    @staticmethod
+    def _clean_stored_answer(answer: str) -> str:
+        """DB에 저장된 포맷 답변에서 템플릿 보일러플레이트를 제거해 핵심 내용만 추출합니다."""
+        text = answer.strip()
+        # [분류: ...] 헤더 제거
+        text = re.sub(r"^\[분류:.*?\]\s*", "", text)
+        # [이전 상담 이력...] 블록 제거 (잘못 저장된 이전 구현 아티팩트)
+        text = re.sub(r"\[이전 상담 이력.*", "", text, flags=re.DOTALL)
+        # [참고한 근거] 이후 블록 제거
+        text = re.sub(r"\[참고한 근거\].*", "", text, flags=re.DOTALL)
+        # ※ 면책 문구 제거
+        text = re.sub(r"※.*", "", text, flags=re.DOTALL)
+        # 섹션 번호 헤더(1. 상황 정리 등) 제거
+        text = re.sub(r"^\d+\.\s*(상황 정리|법적 판단|추가로 확인|지금 할 일|도움을 받을 수 있는 곳)[^\n]*\n?", "", text, flags=re.MULTILINE)
+        # 마크다운 bold 제거
+        text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
+        return text.strip()
+
+    def _format_history(self, past_history: list[dict]) -> str:
+        """과거 상담 이력을 LLM 프롬프트용 텍스트로 변환합니다."""
+        if not past_history:
+            return ""
+        blocks = [
+            "[이전 상담 이력 - 동일 분야 최근 상담]",
+            "아래는 이 사용자가 같은 법률 분야로 이전에 받은 상담 내용입니다.",
+            "중복된 기본 설명 대신, 이전에 안내한 내용 이후의 진행 상황과 다음 단계에 집중하여 답변하세요.\n",
+        ]
+        for i, rec in enumerate(past_history, 1):
+            ts = str(rec.get("timestamp") or "")
+            try:
+                dt = datetime.fromisoformat(ts)
+                date_str = f"{dt.month}월 {dt.day}일"
+            except Exception:
+                date_str = ts[:10]
+            q = str(rec.get("question") or "")
+            a = self._clean_stored_answer(str(rec.get("answer") or ""))
+            a_short = (a[:300] + "...") if len(a) > 300 else a
+            blocks.append(f"[이전 상담 {i} - {date_str}]")
+            blocks.append(f"질문: {q}")
+            blocks.append(f"답변 핵심: {a_short}\n")
+        return "\n".join(blocks)
+
+    async def _generate_single_answer(
+        self,
+        question: str,
+        rag_docs: list[dict[str, Any]],
+        category: str = "",
+        case_frame: Any | None = None,
+        issue_plan: Any | None = None,
+        answer_contract: Any | None = None,
+        past_history: list[dict] | None = None,
+    ) -> str:
         context = self._format_docs(rag_docs)
         contract_context = ""
         if case_frame is not None and issue_plan is not None and answer_contract is not None:
             contract_context = build_contract_context(case_frame, issue_plan, answer_contract)
+
+        user_prompt = RAG_ANSWER_USER.format(context=context, question=question, contract_context=contract_context)
+        if past_history:
+            history_block = self._format_history(past_history)
+            if history_block:
+                user_prompt = history_block + "\n\n" + user_prompt
+
         answer = await llm_client.complete(
             system_prompt=RAG_ANSWER_SYSTEM,
-            user_prompt=RAG_ANSWER_USER.format(context=context, question=question, contract_context=contract_context),
+            user_prompt=user_prompt,
             temperature=0.1,
             model=llm_client.answer_model,
         )
@@ -271,10 +330,25 @@ class ConsistencyChecker:
         case_frame: Any | None = None,
         issue_plan: Any | None = None,
         answer_contract: Any | None = None,
+        past_history: list[dict] | None = None,
     ) -> tuple[str, list[str]]:
-        all_questions = [original_question] + similar_questions
-        tasks = [self._generate_single_answer(q, rag_docs, category=category, case_frame=case_frame, issue_plan=issue_plan, answer_contract=answer_contract) for q in all_questions]
-        results = await asyncio.gather(*tasks)
+        # 원본 질문만 이전 상담 이력을 활용한다.
+        # 유사 질문 10개는 일관성 검증용이므로 이력 없이 순수하게 답변을 생성한다.
+        original_task = self._generate_single_answer(
+            original_question, rag_docs,
+            category=category, case_frame=case_frame,
+            issue_plan=issue_plan, answer_contract=answer_contract,
+            past_history=past_history,
+        )
+        similar_tasks = [
+            self._generate_single_answer(
+                q, rag_docs,
+                category=category, case_frame=case_frame,
+                issue_plan=issue_plan, answer_contract=answer_contract,
+            )
+            for q in similar_questions
+        ]
+        results = await asyncio.gather(original_task, *similar_tasks)
         return results[0], list(results[1:])
 
     def _fallback_answer(self, question: str, rag_docs: list[dict[str, Any]], category: str = "") -> str:
@@ -528,7 +602,16 @@ class ConsistencyChecker:
         print(f"SQQS: {quality_report.get('SQQS')}")
         print(f"raw_consistency_score: {quality_report.get('raw_consistency_score')}")
         print(f"answer_reliability: {quality_report.get('answer_reliability')}")
-    async def run(self, question: str, rag_docs: list[dict[str, Any]] | None = None, legal_category: str = "", case_frame: Any | None = None, issue_plan: Any | None = None, answer_contract: Any | None = None) -> tuple[bool, str, float, list[str]]:
+    async def run(
+        self,
+        question: str,
+        rag_docs: list[dict[str, Any]] | None = None,
+        legal_category: str = "",
+        case_frame: Any | None = None,
+        issue_plan: Any | None = None,
+        answer_contract: Any | None = None,
+        past_history: list[dict] | None = None,
+    ) -> tuple[bool, str, float, list[str]]:
         rag_docs = rag_docs or []
         similar_questions = await self.generate_similar_questions(question)
         original_answer, similar_answers = await self.generate_all_answers(
@@ -539,6 +622,7 @@ class ConsistencyChecker:
             case_frame=case_frame,
             issue_plan=issue_plan,
             answer_contract=answer_contract,
+            past_history=past_history,
         )
 
         is_reliable, score, raw_scores = self.score_answers(original_answer, similar_answers)
