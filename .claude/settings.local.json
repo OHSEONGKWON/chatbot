@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(Head -20)",
+      "PowerShell(Get-Content \"c:\\\\chatbot\\\\data\\\\real_data\\\\New_Dataset\\\\rag_law_chunks.jsonl\" -TotalCount 3 | ForEach-Object { $_ | ConvertFrom-Json | Select-Object chunk_id, @{N='text_preview';E={$_.text.Substring\\(0, [Math]::Min\\(80, $_.text.Length\\)\\)}}, metadata } | ConvertTo-Json)",
+      "PowerShell(Get-Content \"c:\\\\chatbot\\\\data\\\\real_data\\\\New_Dataset\\\\rag_manual_chunks.jsonl\" -TotalCount 3 | ForEach-Object { $_ | ConvertFrom-Json | Select-Object chunk_id, @{N='text_preview';E={$_.text.Substring\\(0, [Math]::Min\\(80, $_.text.Length\\)\\)}}, metadata } | ConvertTo-Json)",
+      "PowerShell(git -C c:\\\\chatbot status)"
+    ]
+  }
+}
