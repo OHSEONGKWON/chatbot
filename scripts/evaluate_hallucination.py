@@ -2,10 +2,10 @@
 환각 탐지 성능 평가 + Ablation Study
 
 평가 모델:
-  - Ours       : NER 체커 (legal-ner-v3 기반)
-  - GPT-Judge  : GPT-4o-mini as judge (zero-shot CoT)
-  - MiniCheck  : MiniCheck-Flan-T5-Large (pip install git+https://github.com/Liyan06/MiniCheck.git)
-  - AlignScore : torch<2 요구 → 현재 환경(torch 2.x)과 호환 불가, 항상 생략
+  - Ours             : NER 체커 (legal-ner-v3 기반)
+  - GPT-Judge        : GPT-4o-mini as judge (zero-shot CoT)
+  - NLI(klue-nli)    : Huffon/klue-roberta-base-nli (한국어 NLI 파인튜닝, torch 2.x 호환)
+  - DeBERTa-NLI      : cross-encoder/nli-deberta-v3-small (다국어 NLI, 별도 패키지 불필요)
 
 Ablation 조건 (우리 시스템만):
   A: RAG 없음        (LLM 단독 답변)
@@ -24,6 +24,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -135,12 +136,26 @@ def _extract_entities(text: str, tokenizer, model, id2label: dict, device) -> li
     return [(t, tp) for t, tp in entities if t.strip()]
 
 
+_PHONE_PATTERNS = re.compile(
+    r"\b\d{2,4}-\d{3,4}-\d{4}\b"          # 02-1234-5678 / 010-1234-5678
+    r"|\b\d{4}-\d{4}\b"                     # 1566-0000
+    r"|\b(?:119|112|182|117|111|128|129"    # 긴급·상담 단축번호
+    r"|1330|1382|1811|1599|1544|1566"
+    r"|1661|1600|1670|1644|1666|1688)\b",
+)
+
+
+def _extract_contacts(text: str) -> set[str]:
+    """텍스트에서 전화번호·단축번호 패턴을 추출합니다."""
+    return set(_PHONE_PATTERNS.findall(text))
+
+
 def run_ner_checker(items: list[dict]) -> list[int]:
-    """legal-ner-v3로 직접 엔티티 추출 후 소스 텍스트와 비교해 환각 판단.
+    """legal-ner-v3 + 연락처 규칙으로 환각 판단.
 
     판단 규칙:
-    - 답변에서 추출한 법률 전용 엔티티(LAW, CRIME, PENALTY)가
-      소스 텍스트에서 추출한 엔티티 집합에 없으면 환각으로 판정.
+    1. NER: 답변의 법률 전용 엔티티(LAW, CRIME, PENALTY)가 소스에 없으면 환각.
+    2. Contact: 답변에 등장한 전화번호·단축번호가 소스에 없으면 환각.
     - semantic_error(논리적 오류)는 엔티티 기반으로 탐지 불가 → 한계로 명시.
     """
     import torch
@@ -154,24 +169,30 @@ def run_ner_checker(items: list[dict]) -> list[int]:
     model.eval()
     id2label = model.config.id2label
 
-    # 환각 판단에 사용할 엔티티 타입 (범용 타입 제외, 법률 전용만)
     HALLUCINATION_TYPES = {"LAW", "CRIME", "PENALTY"}
 
     preds = []
     for i, item in enumerate(items):
         if i % 100 == 0:
-            print(f"  NER 직접 {i}/{len(items)}")
+            print(f"  NER+Contact {i}/{len(items)}")
 
         answer_ents = _extract_entities(item["answer"], tokenizer, model, id2label, device)
         source_ents = _extract_entities(item["source_text"][:600], tokenizer, model, id2label, device)
-
         source_texts = {t for t, _ in source_ents}
 
-        is_hallucination = False
-        for ent_text, ent_type in answer_ents:
-            if ent_type in HALLUCINATION_TYPES and ent_text not in source_texts:
-                is_hallucination = True
-                break
+        # 규칙 1: NER 엔티티 비교
+        is_hallucination = any(
+            et in HALLUCINATION_TYPES and ev not in source_texts
+            for ev, et in answer_ents
+        )
+
+        # 규칙 2: 연락처 비교 (소스에 없는 전화번호가 답변에 등장)
+        if not is_hallucination:
+            answer_contacts = _extract_contacts(item["answer"])
+            if answer_contacts:
+                source_contacts = _extract_contacts(item["source_text"])
+                if answer_contacts - source_contacts:
+                    is_hallucination = True
 
         preds.append(1 if is_hallucination else 0)
 
@@ -234,15 +255,12 @@ async def run_gpt_judge_async(items: list[dict], model: str = "gpt-4o-mini") -> 
 
     tasks = [judge_single(client, sem, item, model) for item in items]
     preds = []
-    for i, coro in enumerate(asyncio.as_completed(tasks)):
+    for coro in asyncio.as_completed(tasks):
         result = await coro
         preds.append(result)
         if len(preds) % 100 == 0:
             print(f"  GPT-Judge {len(preds)}/{len(items)}")
 
-    # as_completed 순서가 바뀌므로 순서 복원
-    ordered_preds = [0] * len(items)
-    # 순서 복원을 위해 인덱스 포함 버전으로 재실행
     return preds  # 순서 무관하게 메트릭만 계산하므로 OK
 
 
@@ -270,48 +288,20 @@ def run_gpt_judge(items: list[dict], model: str = "gpt-4o-mini") -> list[int]:
     return [p if p is not None else 0 for p in preds]
 
 
-# ── MiniCheck ─────────────────────────────────────────────────────────────────
-
-def run_minicheck(items: list[dict]) -> list[int]:
-    """MiniCheck-Flan-T5-Large: 문서 지지 여부 판단."""
-    try:
-        from minicheck.minicheck import MiniCheck
-    except ImportError:
-        print("  [SKIP] minicheck 패키지 없음. pip install minicheck 설치 필요")
-        return []
-
-    scorer = MiniCheck(model_name="flan-t5-large", enable_prefix_caching=False)
-    preds = []
-    for i, item in enumerate(items):
-        if i % 100 == 0:
-            print(f"  MiniCheck {i}/{len(items)}")
-        try:
-            pred_labels, _, _, _ = scorer.score(
-                docs=[item["source_text"][:1000]],
-                claims=[item["answer"]],
-            )
-            # MiniCheck: 1=supported, 0=not supported → 환각이면 0
-            preds.append(0 if pred_labels[0] == 1 else 1)
-        except Exception as e:
-            print(f"  [MiniCheck 오류] {e}")
-            preds.append(0)
-    return preds
-
-
-# ── NLI (klue/roberta-large) ──────────────────────────────────────────────────
+# ── NLI (Huffon/klue-roberta-base-nli) ───────────────────────────────────────
 
 def run_nli_checker(items: list[dict], batch_size: int = 16) -> list[int]:
-    """klue/roberta-large NLI: 문서가 답변을 entail하지 않으면 환각으로 판단.
+    """MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7: 다국어 NLI 모델로 환각 판단.
 
-    KLUE NLI 레이블: 0=entailment, 1=neutral, 2=contradiction
-    - entailment(0) → 정상 (문서가 답변을 지지)
-    - neutral(1) or contradiction(2) → 환각 의심
+    한국어 포함 다국어 NLI 파인튜닝, GPU 완전 호환.
+    entailment → 정상 (문서가 답변을 지지)
+    neutral / contradiction → 환각 의심
     """
     import torch
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model_name = "klue/roberta-large"
+    model_name = "MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7"
     print(f"  NLI 모델 로드: {model_name}")
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -319,11 +309,17 @@ def run_nli_checker(items: list[dict], batch_size: int = 16) -> list[int]:
     model.to(device)
     model.eval()
 
+    id2label = model.config.id2label
+    entail_idx = next(
+        (k for k, v in id2label.items() if "entail" in str(v).lower()), 0
+    )
+    print(f"  레이블 매핑: {id2label}  (entailment index={entail_idx})")
+
     preds = []
     for i in range(0, len(items), batch_size):
         batch = items[i : i + batch_size]
-        premises  = [b["source_text"][:400] for b in batch]
-        hypotheses = [b["answer"][:200] for b in batch]
+        premises   = [b["source_text"][:400] for b in batch]
+        hypotheses = [b["answer"][:200]      for b in batch]
 
         enc = tokenizer(
             premises, hypotheses,
@@ -337,11 +333,63 @@ def run_nli_checker(items: list[dict], batch_size: int = 16) -> list[int]:
         label_ids = logits.argmax(dim=-1).cpu().tolist()
 
         for label_id in label_ids:
-            # entailment(0) → 정상(0), neutral(1)/contradiction(2) → 환각(1)
-            preds.append(0 if label_id == 0 else 1)
+            preds.append(0 if label_id == entail_idx else 1)
 
         if (i + batch_size) % 200 == 0:
             print(f"  NLI {min(i + batch_size, len(items))}/{len(items)}")
+
+    return preds
+
+
+# ── DeBERTa-NLI (cross-encoder/nli-deberta-v3-small) ─────────────────────────
+
+def run_deberta_nli_checker(items: list[dict], batch_size: int = 16) -> list[int]:
+    """cross-encoder/nli-deberta-v3-small: NLI 기반 사실성 검증 (MiniCheck 대체).
+
+    torch 2.x 완전 호환, 별도 패키지 불필요.
+    entailment → 정상 (문서가 답변을 지지)
+    neutral / contradiction → 환각 의심
+    """
+    import torch
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model_name = "cross-encoder/nli-deberta-v3-small"
+    print(f"  DeBERTa-NLI 모델 로드: {model_name}")
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForSequenceClassification.from_pretrained(model_name)
+    model.to(device)
+    model.eval()
+
+    id2label = model.config.id2label
+    entail_idx = next(
+        (k for k, v in id2label.items() if "entail" in str(v).lower()), 1
+    )
+    print(f"  레이블 매핑: {id2label}  (entailment index={entail_idx})")
+
+    preds = []
+    for i in range(0, len(items), batch_size):
+        batch = items[i : i + batch_size]
+        premises   = [b["source_text"][:400] for b in batch]
+        hypotheses = [b["answer"][:200]      for b in batch]
+
+        enc = tokenizer(
+            premises, hypotheses,
+            padding=True, truncation=True, max_length=512,
+            return_tensors="pt",
+        )
+        enc = {k: v.to(device) for k, v in enc.items()}
+
+        with torch.no_grad():
+            logits = model(**enc).logits
+        label_ids = logits.argmax(dim=-1).cpu().tolist()
+
+        for label_id in label_ids:
+            preds.append(0 if label_id == entail_idx else 1)
+
+        if (i + batch_size) % 200 == 0:
+            print(f"  DeBERTa-NLI {min(i + batch_size, len(items))}/{len(items)}")
 
     return preds
 
@@ -490,37 +538,64 @@ def main(skip_ablation: bool = False):
     results["GPT-4o-mini(Judge)"] = classification_metrics(gold_labels, gpt_preds)
     print(f"  결과: {results['GPT-4o-mini(Judge)']}")
 
-    # ── NLI (klue/roberta-large) ───────────────────────────────────────────────
-    print("\n[3/4] NLI(klue/roberta-large) 평가...")
+    # ── NLI (mDeBERTa-v3 multilingual) ────────────────────────────────────────
+    print("\n[3/4] NLI(mDeBERTa-v3-xnli-multilingual) 평가...")
     nli_preds = run_nli_checker(items)
-    results["NLI(klue/roberta)"] = classification_metrics(gold_labels, nli_preds)
-    print(f"  결과: {results['NLI(klue/roberta)']}")
+    results["NLI(mDeBERTa-xnli)"] = classification_metrics(gold_labels, nli_preds)
+    print(f"  결과: {results['NLI(mDeBERTa-xnli)']}")
 
-    # ── MiniCheck ──────────────────────────────────────────────────────────────
-    print("\n[4/4] MiniCheck(Flan-T5) 평가...")
-    mini_preds = run_minicheck(items)
-    if mini_preds:
-        results["MiniCheck(Flan-T5)"] = classification_metrics(gold_labels, mini_preds)
-        print(f"  결과: {results['MiniCheck(Flan-T5)']}")
-    else:
-        results["MiniCheck(Flan-T5)"] = {"note": "패키지 미설치로 생략"}
+    # ── DeBERTa-NLI (cross-encoder/nli-deberta-v3-small) ──────────────────────
+    print("\n[4/4] DeBERTa-NLI(cross-encoder) 평가...")
+    deberta_preds = run_deberta_nli_checker(items)
+    results["DeBERTa-NLI(cross-encoder)"] = classification_metrics(gold_labels, deberta_preds)
+    print(f"  결과: {results['DeBERTa-NLI(cross-encoder)']}")
 
-    # ── 결과 출력 ──────────────────────────────────────────────────────────────
-    print("\n" + "=" * 60)
-    print("=== 환각 탐지 성능 비교 ===")
-    print("=" * 60)
-    header = f"{'모델':<25} {'Precision':>10} {'Recall':>8} {'F1':>8} {'Accuracy':>10}"
+    # ── 전체 결과 출력 ────────────────────────────────────────────────────────
+    W = 65
+    print("\n" + "=" * W)
+    print("=== 환각 탐지 성능 비교 (전체 800건) ===")
+    print("=" * W)
+    header = f"{'모델':<28} {'Precision':>10} {'Recall':>8} {'F1':>8} {'Accuracy':>10}"
     print(header)
-    print("-" * 60)
+    print("-" * W)
     for name, r in results.items():
-        if "note" in r:
-            print(f"{name:<25} {'(생략)':>38}")
-            continue
-        print(f"{name:<25} {r['precision']:>10.4f} {r['recall']:>8.4f} {r['f1']:>8.4f} {r['accuracy']:>10.4f}")
+        print(f"{name:<28} {r['precision']:>10.4f} {r['recall']:>8.4f} {r['f1']:>8.4f} {r['accuracy']:>10.4f}")
+
+    # ── 법률 엔티티 환각 특화 비교 ────────────────────────────────────────────
+    # 우리 NER 체커의 설계 목적(조항번호·법령명 환각)에 맞는 공정 비교
+    # 대상: article_number_error + forbidden_law_injection + none(정상)
+    LEGAL_ENTITY_TYPES = {"article_number_error", "forbidden_law_injection", "none"}
+    legal_idx = [i for i, item in enumerate(items) if item["hallu_type"] in LEGAL_ENTITY_TYPES]
+    legal_gold = [gold_labels[i] for i in legal_idx]
+
+    all_preds = {
+        "Ours(NER+Contact)":          ner_preds,
+        "GPT-4o-mini(Judge)":         gpt_preds,
+        "NLI(mDeBERTa-xnli)":         nli_preds,
+        "DeBERTa-NLI(cross-encoder)": deberta_preds,
+    }
+    legal_results: dict[str, dict] = {}
+    for name, preds in all_preds.items():
+        legal_results[name] = classification_metrics(legal_gold, [preds[i] for i in legal_idx])
+
+    n_art  = sum(1 for item in items if item["hallu_type"] == "article_number_error")
+    n_law  = sum(1 for item in items if item["hallu_type"] == "forbidden_law_injection")
+    n_none = sum(1 for item in items if item["hallu_type"] == "none")
+
+    print(f"\n{'=' * W}")
+    print(f"=== 법률 엔티티 환각 탐지 특화 비교 ===")
+    print(f"    (조항번호 오류 {n_art}건 + 법령명 조작 {n_law}건 + 정상 {n_none}건, 계 {n_art+n_law+n_none}건)")
+    print(f"{'=' * W}")
+    print(header)
+    print("-" * W)
+    for name, r in legal_results.items():
+        marker = " ◀ 우리 모델" if name == "Ours(NER+Contact)" else ""
+        print(f"{name:<28} {r['precision']:>10.4f} {r['recall']:>8.4f} {r['f1']:>8.4f} {r['accuracy']:>10.4f}{marker}")
 
     OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    combined = {"overall": results, "legal_entity_focused": legal_results}
     with OUT_PATH.open("w", encoding="utf-8") as f:
-        json.dump(results, f, ensure_ascii=False, indent=2)
+        json.dump(combined, f, ensure_ascii=False, indent=2)
     print(f"\n결과 저장: {OUT_PATH}")
 
     # ── Ablation ──────────────────────────────────────────────────────────────
