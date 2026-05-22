@@ -2,17 +2,19 @@
 RAG 검색 성능 평가 스크립트 (Phase 3 - Step 2).
 
 지원 입력 형식:
-  A) rag_eval.jsonl      — positive_chunk_id 단일 정답 형식 (LLM 합성)
-  B) golden_candidates.jsonl — golden_doc_ids 다중 정답+relevance 형식 (수동/키워드)
+  A) rag_eval.jsonl          — positive_chunk_id 단일 정답 형식 (LLM 합성)
+  B) golden_candidates.jsonl — golden_doc_ids 다중 정답+relevance 형식 (자동 키워드)
+  C) rag_eval_golden.jsonl   — golden_doc_ids 다중 정답, 수동 3계층 검토 완료본 (권장)
 
 계산 메트릭:
-  Hit@1, Hit@3, Hit@5, MRR, NDCG@5
+  Hit@1, Hit@3, Hit@5, MRR, NDCG@5 (graded: rel=2 핵심근거, rel=1 보조근거)
 
 실행:
   python scripts/evaluate_rag_comprehensive.py
-  python scripts/evaluate_rag_comprehensive.py --eval golden   # golden_candidates.jsonl 사용
-  python scripts/evaluate_rag_comprehensive.py --top-k 10      # 검색 범위 확장
-  python scripts/evaluate_rag_comprehensive.py --skip-zero     # relevance=0 항목 제외
+  python scripts/evaluate_rag_comprehensive.py --eval golden_reviewed  # 수동 검토 완료본 (권장)
+  python scripts/evaluate_rag_comprehensive.py --eval golden           # 자동 키워드 후보
+  python scripts/evaluate_rag_comprehensive.py --top-k 10             # 검색 범위 확장
+  python scripts/evaluate_rag_comprehensive.py --skip-zero            # relevance=0 항목 제외
 """
 
 from __future__ import annotations
@@ -31,9 +33,10 @@ from src.modules.rag import retriever
 
 # ── 파일 경로 ─────────────────────────────────────────────────────────────────
 EVAL_FILES = {
-    "bio":      REPO_ROOT / "data" / "evaluation" / "rag_eval.jsonl",
-    "remapped": REPO_ROOT / "data" / "evaluation" / "rag_eval_remapped.jsonl",
-    "golden":   REPO_ROOT / "data" / "evaluation" / "golden_candidates.jsonl",
+    "bio":             REPO_ROOT / "data" / "evaluation" / "rag_eval.jsonl",
+    "remapped":        REPO_ROOT / "data" / "evaluation" / "rag_eval_remapped.jsonl",
+    "golden":          REPO_ROOT / "data" / "evaluation" / "golden_candidates.jsonl",
+    "golden_reviewed": REPO_ROOT / "data" / "evaluation" / "rag_eval_golden.jsonl",
 }
 RESULTS_DIR = REPO_ROOT / "results"
 
@@ -284,8 +287,9 @@ def _print_failures(results: list[dict], k: int = 10) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--eval", choices=["bio", "remapped", "golden"], default="remapped",
-                        help="평가셋 선택: remapped=재매핑 완료(권장), bio=원본, golden=수동레이블")
+    parser.add_argument("--eval", choices=["bio", "remapped", "golden", "golden_reviewed"],
+                        default="remapped",
+                        help="평가셋 선택: golden_reviewed=수동3계층검토(권장), remapped=재매핑, bio=원본, golden=자동키워드")
     parser.add_argument("--top-k", type=int, default=10,
                         help="검색 범위 (기본값: 10)")
     parser.add_argument("--skip-zero", action="store_true",
@@ -307,7 +311,7 @@ def main() -> None:
 
     if args.eval in ("bio", "remapped"):
         items = _load_bio(eval_path, args.skip_zero, domain_filter=args.domain_filter)
-    else:
+    else:  # golden, golden_reviewed
         items = _load_golden(eval_path, args.skip_zero)
 
     print(f"로드된 케이스: {len(items)}개\n검색 중...")
