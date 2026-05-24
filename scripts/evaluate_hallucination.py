@@ -136,26 +136,11 @@ def _extract_entities(text: str, tokenizer, model, id2label: dict, device) -> li
     return [(t, tp) for t, tp in entities if t.strip()]
 
 
-_PHONE_PATTERNS = re.compile(
-    r"\b\d{2,4}-\d{3,4}-\d{4}\b"          # 02-1234-5678 / 010-1234-5678
-    r"|\b\d{4}-\d{4}\b"                     # 1566-0000
-    r"|\b(?:119|112|182|117|111|128|129"    # 긴급·상담 단축번호
-    r"|1330|1382|1811|1599|1544|1566"
-    r"|1661|1600|1670|1644|1666|1688)\b",
-)
-
-
-def _extract_contacts(text: str) -> set[str]:
-    """텍스트에서 전화번호·단축번호 패턴을 추출합니다."""
-    return set(_PHONE_PATTERNS.findall(text))
-
-
 def run_ner_checker(items: list[dict]) -> list[int]:
-    """legal-ner-v3 + 연락처 규칙으로 환각 판단.
+    """legal-ner-v3 모델로 환각 판단.
 
     판단 규칙:
     1. NER: 답변의 법률 전용 엔티티(LAW, CRIME, PENALTY)가 소스에 없으면 환각.
-    2. Contact: 답변에 등장한 전화번호·단축번호가 소스에 없으면 환각.
     - semantic_error(논리적 오류)는 엔티티 기반으로 탐지 불가 → 한계로 명시.
     """
     import torch
@@ -185,14 +170,6 @@ def run_ner_checker(items: list[dict]) -> list[int]:
             et in HALLUCINATION_TYPES and ev not in source_texts
             for ev, et in answer_ents
         )
-
-        # 규칙 2: 연락처 비교 (소스에 없는 전화번호가 답변에 등장)
-        if not is_hallucination:
-            answer_contacts = _extract_contacts(item["answer"])
-            if answer_contacts:
-                source_contacts = _extract_contacts(item["source_text"])
-                if answer_contacts - source_contacts:
-                    is_hallucination = True
 
         preds.append(1 if is_hallucination else 0)
 
@@ -569,7 +546,7 @@ def main(skip_ablation: bool = False):
     legal_gold = [gold_labels[i] for i in legal_idx]
 
     all_preds = {
-        "Ours(NER+Contact)":          ner_preds,
+        "Ours(NER)":                  ner_preds,
         "GPT-4o-mini(Judge)":         gpt_preds,
         "NLI(mDeBERTa-xnli)":         nli_preds,
         "DeBERTa-NLI(cross-encoder)": deberta_preds,
@@ -589,7 +566,7 @@ def main(skip_ablation: bool = False):
     print(header)
     print("-" * W)
     for name, r in legal_results.items():
-        marker = " ◀ 우리 모델" if name == "Ours(NER+Contact)" else ""
+        marker = " ◀ 우리 모델" if name == "Ours(NER)" else ""
         print(f"{name:<28} {r['precision']:>10.4f} {r['recall']:>8.4f} {r['f1']:>8.4f} {r['accuracy']:>10.4f}{marker}")
 
     OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
