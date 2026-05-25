@@ -23,7 +23,8 @@
       "PowerShell(python scripts/evaluate_rag_comprehensive.py --eval golden_reviewed --skip-zero --compare --save 2>&1)",
       "PowerShell(python scripts/evaluate_rag_comprehensive.py --eval golden_reviewed --skip-zero --compare --rerank-model \"cross-encoder/ms-marco-MiniLM-L-6-v2\" 2>&1)",
       "PowerShell(python scripts/evaluate_rag_comprehensive.py --eval golden_reviewed --skip-zero --compare --rerank-model \"Dongjin-kr/ko-reranker\" 2>&1)",
-      "PowerShell(python scripts/evaluate_rag_comprehensive.py --eval golden_reviewed --skip-zero --compare --rerank-model llm --save 2>&1)"
+      "PowerShell(python scripts/evaluate_rag_comprehensive.py --eval golden_reviewed --skip-zero --compare --rerank-model llm --save 2>&1)",
+      "Bash(python -c ' *)"
     ]
   }
 }

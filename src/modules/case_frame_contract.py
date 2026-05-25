@@ -415,13 +415,14 @@ def should_force_answer(text: str) -> bool:
 
 
 def should_answer_without_requery(case_frame: CaseFrame, issue_plan: IssuePlan) -> bool:
+    # 성적 대가 조건(조건부 이익): 세 가지 모두 확인되면 충분한 사실관계
     if case_frame.condition_or_exchange and case_frame.requested_act and case_frame.relationship:
         return True
-    if case_frame.unpaid_claim and case_frame.relationship:
+    # 임금체불: 미지급 주장 + 관계만으로는 부족 — 목적(user_question)까지 확인되어야 우회
+    if case_frame.unpaid_claim and case_frame.relationship and case_frame.user_question:
         return True
-    # 신체 접촉 행위는 관계 + 신체 부위 둘 다 확인되어야 우회 허용 (하나만으로는 부족)
-    if case_frame.performed_act and case_frame.relationship and case_frame.body_part:
-        return True
+    # 신체접촉 강제추행: clarification에서 timing + purpose 엄격 검사 중이므로 우회 제거
+    # (performed_act + relationship + body_part 조합만으로는 재질문이 필요한 경우가 많음)
     return issue_plan.confidence >= 0.85 and bool(issue_plan.primary_issue)
 
 
