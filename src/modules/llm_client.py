@@ -8,6 +8,10 @@ from ..config import config
 
 logger = logging.getLogger("lawsguard.llm")
 
+_MAX_RETRIES = 3
+_RETRY_BASE_DELAY = 1.0  # seconds; doubles each attempt (1s → 2s → 4s)
+_NO_RETRY_STATUS = {400, 401, 403}  # bad request / auth — retrying won't help
+
 
 class LLMClient:
     def __init__(self):
@@ -69,33 +73,38 @@ class LLMClient:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
 
-        try:
-            request_kwargs = {
-                "model": model or config.llm.model_name,
-                "messages": messages,
-                "temperature": config.llm.temperature if temperature is None else temperature,
-                "max_tokens": max_tokens or config.llm.max_tokens,
-            }
-            if json_mode:
-                request_kwargs["response_format"] = {"type": "json_object"}
-            response = await client.chat.completions.create(**request_kwargs)
-            return (response.choices[0].message.content or "").strip()
-        except Exception as e:
-            logger.error(f"LLM 호출 실패: {e}")
-            if json_mode:
-                try:
-                    request_kwargs = {
-                        "model": model or config.llm.model_name,
-                        "messages": messages,
-                        "temperature": config.llm.temperature if temperature is None else temperature,
-                        "max_tokens": max_tokens or config.llm.max_tokens,
-                    }
-                    response = await client.chat.completions.create(**request_kwargs)
-                    return (response.choices[0].message.content or "").strip()
-                except Exception as e2:
-                    logger.error(f"LLM 재시도 실패: {e2}")
-                    return ""
-            return ""
+        request_kwargs: dict = {
+            "model": model or config.llm.model_name,
+            "messages": messages,
+            "temperature": config.llm.temperature if temperature is None else temperature,
+            "max_tokens": max_tokens or config.llm.max_tokens,
+        }
+        if json_mode:
+            request_kwargs["response_format"] = {"type": "json_object"}
+
+        last_exc: Exception | None = None
+        for attempt in range(_MAX_RETRIES):
+            try:
+                response = await client.chat.completions.create(**request_kwargs)
+                return (response.choices[0].message.content or "").strip()
+            except Exception as e:
+                last_exc = e
+                status = getattr(e, "status_code", None)
+                if status in _NO_RETRY_STATUS:
+                    logger.error("LLM 호출 불가 (status=%s): %s", status, e)
+                    break
+                if attempt < _MAX_RETRIES - 1:
+                    delay = _RETRY_BASE_DELAY * (2 ** attempt)
+                    if status == 429:
+                        delay = max(delay, 5.0)
+                    logger.warning(
+                        "LLM 호출 실패 (시도 %d/%d): %s — %.0fs 후 재시도",
+                        attempt + 1, _MAX_RETRIES, e, delay,
+                    )
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error("LLM 호출 최종 실패 (%d회): %s", _MAX_RETRIES, e)
+        return ""
 
     async def complete_many(self, prompts: list[str], system: Optional[str] = None) -> list[str]:
         return await asyncio.gather(*(self.complete(prompt, system=system) for prompt in prompts))

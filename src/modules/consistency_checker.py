@@ -87,15 +87,11 @@ class ConsistencyChecker:
     def _load_embedder(self):
         if self._embedder is not None:
             return self._embedder
-        if SentenceTransformer is None:
-            return None
         try:
-            self._embedder = SentenceTransformer(self._embedder_name, device=self._get_device())
+            from .embedder import get_embedder
+            self._embedder = get_embedder()
         except Exception:
-            try:
-                self._embedder = SentenceTransformer(config.rag.embedding_model, device=self._get_device())
-            except Exception:
-                self._embedder = None
+            self._embedder = None
         return self._embedder
 
 
@@ -449,12 +445,50 @@ class ConsistencyChecker:
         scores = similar_embs @ original_emb
         return [float(s) for s in scores]
 
+    # ── 클레임 단위 일관성 ────────────────────────────────────────────────────────
+
+    _ARTICLE_RE  = re.compile(r"제\s*\d+\s*조(?:의\s*\d+)?")
+    _PENALTY_RE  = re.compile(r"\d+\s*년\s*(?:이상|이하|미만|초과)")
+    _AMOUNT_RE   = re.compile(r"\d[\d,]*\s*만원\s*(?:이상|이하|미만|초과)?")
+
+    def _extract_numeric_claims(self, text: str) -> set[str]:
+        """법조항 번호·형량·금액 클레임을 추출해 정규화된 문자열 집합으로 반환."""
+        claims: set[str] = set()
+        for m in self._ARTICLE_RE.finditer(text):
+            claims.add(re.sub(r"\s+", "", m.group()))
+        for m in self._PENALTY_RE.finditer(text):
+            claims.add(re.sub(r"\s+", "", m.group()))
+        for m in self._AMOUNT_RE.finditer(text):
+            claims.add(re.sub(r"[\s,]+", "", m.group()))
+        return claims
+
+    def _claim_consistency_score(self, original_answer: str, similar_answers: list[str]) -> float:
+        """원본과 유사 답변들이 동일한 수치·법조항을 인용하는지 측정 (0~1).
+
+        원본 클레임이 없으면 1.0(패스). 유사 답변이 언급하지 않으면 0.5로 처리.
+        """
+        orig_claims = self._extract_numeric_claims(original_answer)
+        if not orig_claims:
+            return 1.0
+        total = 0.0
+        for sim_ans in similar_answers:
+            sim_claims = self._extract_numeric_claims(sim_ans)
+            if not sim_claims:
+                total += 0.5  # 언급 없음 → 부분 일치
+            else:
+                overlap = len(orig_claims & sim_claims) / len(orig_claims)
+                total += overlap
+        return total / len(similar_answers) if similar_answers else 1.0
+
     def score_answers(self, original_answer: str, similar_answers: list[str]) -> tuple[bool, float, list[float]]:
         scores = self._cosine_similarity_scores(original_answer, similar_answers)
         if not scores:
             return False, 0.0, []
-        median_score = float(statistics.median(scores))
-        return median_score >= self.threshold, median_score, scores
+        semantic_score = float(statistics.median(scores))
+        claim_score = self._claim_consistency_score(original_answer, similar_answers)
+        # 클레임 불일치가 있으면 전체 신뢰도를 낮춤 (가중치 30%)
+        combined = 0.70 * semantic_score + 0.30 * claim_score
+        return combined >= self.threshold, combined, scores
 
 
     def _tokenize_simple(self, text: str) -> set[str]:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 
 
-MAX_SIMPLE_TEXT_CHARS = 900
+MAX_SIMPLE_TEXT_CHARS = 950  # Kakao API 한도 1000자 대비 50자 여유
 MAX_OUTPUTS = 3
 
 

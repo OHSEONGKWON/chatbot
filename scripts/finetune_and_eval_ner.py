@@ -62,7 +62,7 @@ LABEL2ID = {label: idx for idx, label in enumerate(LABELS)}
 ID2LABEL = {idx: label for label, idx in LABEL2ID.items()}
 ENTITY_TYPES = ["LAW", "PENALTY", "AMOUNT", "DATE", "ORG", "CRIME"]
 
-OUR_MODEL_PATH = REPO_ROOT / "outputs" / "legal-ner-lawsguard-v3"
+OUR_MODEL_PATH = REPO_ROOT / "outputs" / "legal-ner-v3"
 BASELINES_DIR = REPO_ROOT / "outputs" / "baselines"
 
 BASELINE_MODELS = [
@@ -203,7 +203,7 @@ def compute_metrics_callback(eval_pred):
 
 
 def compute_span_f1_by_type(preds: list[list[int]], labels: list[list[int]]) -> dict:
-    """테스트셋 span-level F1: 엔티티 유형별 + macro."""
+    """테스트셋 span-level F1: 엔티티 유형별 + macro + micro."""
     tp = {t: 0 for t in ENTITY_TYPES}
     fp = {t: 0 for t in ENTITY_TYPES}
     fn = {t: 0 for t in ENTITY_TYPES}
@@ -229,7 +229,34 @@ def compute_span_f1_by_type(preds: list[list[int]], labels: list[list[int]]) -> 
         results[t] = {"precision": round(prec, 4), "recall": round(rec, 4), "f1": round(f1, 4)}
         f1_scores.append(f1)
     results["macro_f1"] = round(sum(f1_scores) / len(f1_scores), 4)
+
+    # micro 평균 (전체 엔티티 합산 기반)
+    total_tp = sum(tp.values())
+    total_fp = sum(fp.values())
+    total_fn = sum(fn.values())
+    micro_p = total_tp / (total_tp + total_fp) if total_tp + total_fp else 0.0
+    micro_r = total_tp / (total_tp + total_fn) if total_tp + total_fn else 0.0
+    micro_f1 = 2 * micro_p * micro_r / (micro_p + micro_r) if micro_p + micro_r else 0.0
+    results["precision"] = round(micro_p, 4)
+    results["recall"] = round(micro_r, 4)
+    results["f1"] = round(micro_f1, 4)
     return results
+
+
+def _flatten_for_paper(metrics: dict) -> dict:
+    """compute_span_f1_by_type 결과를 generate_paper_tables.py 형식으로 변환.
+
+    형식: {precision, recall, f1, macro_f1, f1_LAW, f1_CRIME, ...}
+    """
+    flat: dict = {
+        "precision": metrics.get("precision", 0.0),
+        "recall":    metrics.get("recall", 0.0),
+        "f1":        metrics.get("f1", 0.0),
+        "macro_f1":  metrics.get("macro_f1", 0.0),
+    }
+    for t in ENTITY_TYPES:
+        flat[f"f1_{t}"] = metrics.get(t, {}).get("f1", 0.0)
+    return flat
 
 
 # ── 훈련 / 평가 ───────────────────────────────────────────────────────────────
@@ -253,10 +280,10 @@ def _run_predict(model, tokenizer, test_dataset, batch_size, seed, output_dir) -
         return {}
     preds = pred_output.predictions.argmax(-1).tolist()
     labels_list = pred_output.label_ids.tolist()
-    metrics = compute_span_f1_by_type(preds, labels_list)
+    raw = compute_span_f1_by_type(preds, labels_list)
     model.cpu()
     torch.cuda.empty_cache()
-    return metrics
+    return _flatten_for_paper(raw)
 
 
 def finetune_and_evaluate(
@@ -495,7 +522,7 @@ def main() -> int:
 
     print_results(all_results)
 
-    out_path = REPO_ROOT / "outputs" / "ner_fair_eval_results.json"
+    out_path = REPO_ROOT / "outputs" / "ner_compare_results.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", encoding="utf-8") as f:
         json.dump(all_results, f, ensure_ascii=False, indent=2)

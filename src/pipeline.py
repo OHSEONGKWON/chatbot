@@ -22,7 +22,6 @@ from .modules.ner_checker import ner_checker
 from .modules.rag import retriever
 from .session_store import session_store
 from .config import config
-from .evaluation import evaluate_pipeline_output, EvaluationResult
 from .chat_history import chat_history
 
 
@@ -43,12 +42,6 @@ class PipelineResult:
     original_consistency_answer: str = ""
     ner_mismatches: list[dict[str, Any]] | None = None
     ner_mid_confidence_warnings: list[dict[str, Any]] | None = None
-    # 4-지표 평가 결과 (step_reached=7인 정상 완료 응답에서만 산정)
-    sim_score: Optional[float] = None   # 유사성 지표
-    rag_score: Optional[float] = None   # RAG 품질 지표
-    ner_score: Optional[float] = None   # NER 지표
-    final_score: Optional[float] = None # 최종 지표
-    eval_detail: dict[str, Any] | None = None
 
 
 class LawsGuardPipeline:
@@ -198,22 +191,9 @@ class LawsGuardPipeline:
 
         if answer_reliability < self._cfg.hallucination.consistency_threshold:
             if not (rrs_report.get("score", 0.0) >= 0.72 and issue_plan.confidence >= 0.70):
-                session.retry_count += 1
-                requery_message = self._cfg.clarification.fallback_message
-                quality_report = self._build_quality_report(extra={"RRS": rrs_report, "CaseFrame": case_frame.to_dict(), "IssuePlan": issue_plan.to_dict(), "AnswerContract": answer_contract.to_dict()})
-                return PipelineResult(
-                    response_text=requery_message,
-                    needs_requery=True,
-                    session_ended=False,
-                    legal_category=legal_category,
-                    step_reached=4,
-                    answer_reliability=answer_reliability,
-                    rrs=rrs_report.get("score"),
-                    quality_report=quality_report,
-                    similar_questions=quality_report.get("similar_questions"),
-                    similar_answers=quality_report.get("similar_answers"),
-                    original_consistency_answer=quality_report.get("original_answer", ""),
-                )
+                # 일관성 낮음: 환각 위험이 있으므로 LLM 생성 답변 대신 안전 템플릿 답변으로 대체.
+                # 거절(requery) 대신 계속 진행해 사용자가 항상 어떤 답변이든 받도록 한다.
+                original_answer = build_safe_contract_answer(case_frame, issue_plan)
 
         initial_contract_check = check_answer_contract(original_answer, case_frame, issue_plan, answer_contract)
         if initial_contract_check.has_blocking_violation:
@@ -271,21 +251,6 @@ class LawsGuardPipeline:
             rrs_report=rrs_report,
         )
 
-        eval_result: EvaluationResult = evaluate_pipeline_output(
-            raw_consistency_score=float(quality_report.get("raw_consistency_score") or 0.0),
-            sqqs_detail=quality_report.get("SQQS_detail") or {},
-            rrs_report=rrs_report,
-            found_entities=list(getattr(ner_result, "found_entities", None) or []),
-            mismatches=list(getattr(ner_result, "mismatched_entities", None) or []),
-            mid_confidence_warnings=list(getattr(ner_result, "mid_confidence_warnings", None) or []),
-        )
-        quality_report["EVALUATION"] = {
-            "sim": eval_result.sim_detail,
-            "rag": eval_result.rag_detail,
-            "ner": eval_result.ner_detail,
-            "final": eval_result.final_detail,
-        }
-
         session_store.delete(user_id)
 
         try:
@@ -318,11 +283,6 @@ class LawsGuardPipeline:
             original_consistency_answer=quality_report.get("original_answer", ""),
             ner_mismatches=getattr(ner_result, "mismatched_entities", None),
             ner_mid_confidence_warnings=getattr(ner_result, "mid_confidence_warnings", None),
-            sim_score=eval_result.sim_score,
-            rag_score=eval_result.rag_score,
-            ner_score=eval_result.ner_score,
-            final_score=eval_result.final_score,
-            eval_detail=quality_report["EVALUATION"],
         )
 
 

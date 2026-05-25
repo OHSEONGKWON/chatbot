@@ -3,14 +3,15 @@
 
 평가 모델:
   - Ours             : NER 체커 (legal-ner-v3 기반)
-  - GPT-Judge        : GPT-4o-mini as judge (zero-shot CoT)
-  - NLI(klue-nli)    : Huffon/klue-roberta-base-nli (한국어 NLI 파인튜닝, torch 2.x 호환)
-  - DeBERTa-NLI      : cross-encoder/nli-deberta-v3-small (다국어 NLI, 별도 패키지 불필요)
+  - KLUE-NLI         : Huffon/klue-roberta-base-nli (한국어 NLI 파인튜닝)
+  - mDeBERTa-NLI     : MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7 (다국어 NLI)
+  - DeBERTa-NLI      : cross-encoder/nli-deberta-v3-small (Cross-encoder NLI)
+  - BERTScore        : xlm-roberta-large 기반 의미 유사도 (threshold=0.85)
 
 Ablation 조건 (우리 시스템만):
   A: RAG 없음        (LLM 단독 답변)
   B: RAG             (RAG 검색 + LLM)
-  C: RAG + SIM       (+ 일관성 검사)
+  C: RAG + SIM       (+ 일관성 검사, ConsistencyChecker)
   D: RAG + SIM + NER (전체 파이프라인)
 
 사용법:
@@ -24,7 +25,6 @@ import argparse
 import asyncio
 import json
 import os
-import re
 import sys
 from pathlib import Path
 
@@ -37,7 +37,6 @@ from dotenv import load_dotenv
 
 load_dotenv(REPO_ROOT / ".env")
 
-import numpy as np
 from openai import AsyncOpenAI
 
 HALLU_EVAL_PATH = REPO_ROOT / "data" / "evaluation" / "hallu_eval.jsonl"
@@ -46,6 +45,7 @@ ABLATION_OUT_PATH = REPO_ROOT / "outputs" / "ablation_results.json"
 
 NER_MODEL_PATH = str(REPO_ROOT / "outputs" / "legal-ner-v3")
 CONCURRENCY = 10
+BERTSCORE_THRESHOLD = 0.85
 
 
 # ── 데이터 로드 ───────────────────────────────────────────────────────────────
@@ -87,10 +87,9 @@ def classification_metrics(labels: list[int], preds: list[int]) -> dict:
     }
 
 
-# ── 우리 NER 체커 (직접 구현, sentence_transformers 의존성 없음) ───────────────
+# ── 우리 NER 체커 ─────────────────────────────────────────────────────────────
 
 def _extract_entities(text: str, tokenizer, model, id2label: dict, device) -> list[tuple[str, str]]:
-    """텍스트에서 NER 엔티티를 추출. [(entity_text, entity_type), ...]"""
     import torch
     enc = tokenizer(
         text, return_tensors="pt", truncation=True, max_length=512,
@@ -109,7 +108,7 @@ def _extract_entities(text: str, tokenizer, model, id2label: dict, device) -> li
     cur_type: str | None = None
 
     for token, pred_id, (char_s, char_e) in zip(tokens, pred_ids, offset_mapping):
-        if char_s == char_e:   # 특수토큰 ([CLS], [SEP], padding)
+        if char_s == char_e:
             if cur_tokens:
                 entities.append(("".join(cur_tokens), cur_type))
                 cur_tokens, cur_type = [], None
@@ -137,12 +136,7 @@ def _extract_entities(text: str, tokenizer, model, id2label: dict, device) -> li
 
 
 def run_ner_checker(items: list[dict]) -> list[int]:
-    """legal-ner-v3 모델로 환각 판단.
-
-    판단 규칙:
-    1. NER: 답변의 법률 전용 엔티티(LAW, CRIME, PENALTY)가 소스에 없으면 환각.
-    - semantic_error(논리적 오류)는 엔티티 기반으로 탐지 불가 → 한계로 명시.
-    """
+    """legal-ner-v3로 법률 엔티티(LAW/CRIME/PENALTY)가 소스에 없으면 환각으로 판정."""
     import torch
     from transformers import AutoModelForTokenClassification, AutoTokenizer
 
@@ -159,215 +153,135 @@ def run_ner_checker(items: list[dict]) -> list[int]:
     preds = []
     for i, item in enumerate(items):
         if i % 100 == 0:
-            print(f"  NER+Contact {i}/{len(items)}")
+            print(f"  NER {i}/{len(items)}")
 
         answer_ents = _extract_entities(item["answer"], tokenizer, model, id2label, device)
         source_ents = _extract_entities(item["source_text"][:600], tokenizer, model, id2label, device)
         source_texts = {t for t, _ in source_ents}
 
-        # 규칙 1: NER 엔티티 비교
         is_hallucination = any(
             et in HALLUCINATION_TYPES and ev not in source_texts
             for ev, et in answer_ents
         )
-
         preds.append(1 if is_hallucination else 0)
 
     return preds
 
 
-# ── GPT-Judge ─────────────────────────────────────────────────────────────────
+# ── 공통 NLI 유틸 ─────────────────────────────────────────────────────────────
 
-GPT_JUDGE_SYSTEM = """당신은 법률 정보의 정확성을 검증하는 전문가입니다.
-[참고 문서]와 [답변]을 비교하여 답변에 사실적 오류(환각)가 있는지 판단하세요.
-
-환각 기준:
-1. 참고 문서에 없는 법조항 번호나 법률명 언급
-2. 날조된 판례 번호나 존재하지 않는 법령 인용
-3. 잘못된 연락처나 기관 전화번호
-4. 참고 문서의 내용과 의미가 반대되거나 조건이 틀린 서술
-
-출력 형식 (JSON):
-{
-  "reasoning": "2-3문장으로 판단 근거",
-  "has_hallucination": true 또는 false
-}"""
-
-
-async def judge_single(
-    client: AsyncOpenAI,
-    sem: asyncio.Semaphore,
-    item: dict,
-    model: str,
-) -> int:
-    async with sem:
-        try:
-            resp = await client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": GPT_JUDGE_SYSTEM},
-                    {
-                        "role": "user",
-                        "content": (
-                            f"[참고 문서]\n{item['source_text'][:500]}\n\n"
-                            f"[질문]\n{item['question']}\n\n"
-                            f"[답변]\n{item['answer']}"
-                        ),
-                    },
-                ],
-                temperature=0.0,
-                max_tokens=300,
-                response_format={"type": "json_object"},
-            )
-            parsed = json.loads(resp.choices[0].message.content)
-            return 1 if parsed.get("has_hallucination", False) else 0
-        except Exception as e:
-            print(f"  [GPT-Judge 오류] {e}")
-            return 0
-
-
-async def run_gpt_judge_async(items: list[dict], model: str = "gpt-4o-mini") -> list[int]:
-    client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    sem = asyncio.Semaphore(CONCURRENCY)
-
-    tasks = [judge_single(client, sem, item, model) for item in items]
-    preds = []
-    for coro in asyncio.as_completed(tasks):
-        result = await coro
-        preds.append(result)
-        if len(preds) % 100 == 0:
-            print(f"  GPT-Judge {len(preds)}/{len(items)}")
-
-    return preds  # 순서 무관하게 메트릭만 계산하므로 OK
-
-
-def run_gpt_judge(items: list[dict], model: str = "gpt-4o-mini") -> list[int]:
-    print(f"  GPT-Judge 실행 중... ({len(items)}개, 동시 {CONCURRENCY}개)")
-
-    async def _run():
-        client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        sem = asyncio.Semaphore(CONCURRENCY)
-
-        results = [None] * len(items)
-
-        async def _judge(idx: int, item: dict):
-            results[idx] = await judge_single(client, sem, item, model)
-
-        tasks = [_judge(i, item) for i, item in enumerate(items)]
-        for i, coro in enumerate(asyncio.as_completed(tasks)):
-            await coro
-            if (i + 1) % 100 == 0:
-                print(f"  GPT-Judge {i + 1}/{len(items)}")
-
-        return results
-
-    preds = asyncio.run(_run())
-    return [p if p is not None else 0 for p in preds]
-
-
-# ── NLI (Huffon/klue-roberta-base-nli) ───────────────────────────────────────
-
-def run_nli_checker(items: list[dict], batch_size: int = 16) -> list[int]:
-    """MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7: 다국어 NLI 모델로 환각 판단.
-
-    한국어 포함 다국어 NLI 파인튜닝, GPU 완전 호환.
-    entailment → 정상 (문서가 답변을 지지)
-    neutral / contradiction → 환각 의심
-    """
+def _load_nli_model(model_name: str):
     import torch
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model_name = "MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7"
     print(f"  NLI 모델 로드: {model_name}")
-
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForSequenceClassification.from_pretrained(model_name)
-    model.to(device)
-    model.eval()
-
+    model.to(device).eval()
     id2label = model.config.id2label
-    entail_idx = next(
-        (k for k, v in id2label.items() if "entail" in str(v).lower()), 0
-    )
+    entail_idx = next((k for k, v in id2label.items() if "entail" in str(v).lower()), 0)
     print(f"  레이블 매핑: {id2label}  (entailment index={entail_idx})")
+    return tokenizer, model, entail_idx, device
 
+
+def _nli_batch_predict(
+    premises: list[str],
+    hypotheses: list[str],
+    tokenizer,
+    model,
+    entail_idx: int,
+    device,
+    batch_size: int = 16,
+    label: str = "NLI",
+) -> list[int]:
+    import torch
     preds = []
-    for i in range(0, len(items), batch_size):
-        batch = items[i : i + batch_size]
-        premises   = [b["source_text"][:400] for b in batch]
-        hypotheses = [b["answer"][:200]      for b in batch]
-
-        enc = tokenizer(
-            premises, hypotheses,
-            padding=True, truncation=True, max_length=512,
-            return_tensors="pt",
-        )
+    for i in range(0, len(premises), batch_size):
+        bp = premises[i : i + batch_size]
+        bh = hypotheses[i : i + batch_size]
+        enc = tokenizer(bp, bh, padding=True, truncation=True, max_length=512, return_tensors="pt")
         enc = {k: v.to(device) for k, v in enc.items()}
-
         with torch.no_grad():
             logits = model(**enc).logits
-        label_ids = logits.argmax(dim=-1).cpu().tolist()
-
-        for label_id in label_ids:
+        for label_id in logits.argmax(dim=-1).cpu().tolist():
             preds.append(0 if label_id == entail_idx else 1)
-
         if (i + batch_size) % 200 == 0:
-            print(f"  NLI {min(i + batch_size, len(items))}/{len(items)}")
-
+            print(f"  {label} {min(i + batch_size, len(premises))}/{len(premises)}")
     return preds
 
 
-# ── DeBERTa-NLI (cross-encoder/nli-deberta-v3-small) ─────────────────────────
+# ── KLUE-RoBERTa NLI (한국어 특화) ───────────────────────────────────────────
+
+def run_klue_nli_checker(items: list[dict], batch_size: int = 16) -> list[int]:
+    """Huffon/klue-roberta-base-nli: 한국어 NLI 파인튜닝 모델로 환각 판단.
+
+    entailment → 정상, neutral/contradiction → 환각 의심.
+    """
+    tokenizer, model, entail_idx, device = _load_nli_model("Huffon/klue-roberta-base-nli")
+    sources = [b["source_text"][:400] for b in items]
+    answers = [b["answer"][:200] for b in items]
+    return _nli_batch_predict(sources, answers, tokenizer, model, entail_idx, device, batch_size, "KLUE-NLI")
+
+
+# ── mDeBERTa-NLI (다국어) ─────────────────────────────────────────────────────
+
+def run_nli_checker(items: list[dict], batch_size: int = 16) -> list[int]:
+    """MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7: 다국어 NLI 모델.
+
+    entailment → 정상, neutral/contradiction → 환각 의심.
+    """
+    tokenizer, model, entail_idx, device = _load_nli_model(
+        "MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7"
+    )
+    sources = [b["source_text"][:400] for b in items]
+    answers = [b["answer"][:200] for b in items]
+    return _nli_batch_predict(sources, answers, tokenizer, model, entail_idx, device, batch_size, "mDeBERTa-NLI")
+
+
+# ── DeBERTa-NLI Cross-encoder ─────────────────────────────────────────────────
 
 def run_deberta_nli_checker(items: list[dict], batch_size: int = 16) -> list[int]:
-    """cross-encoder/nli-deberta-v3-small: NLI 기반 사실성 검증 (MiniCheck 대체).
+    """cross-encoder/nli-deberta-v3-small: Cross-encoder NLI 기반 환각 판단.
 
-    torch 2.x 완전 호환, 별도 패키지 불필요.
-    entailment → 정상 (문서가 답변을 지지)
-    neutral / contradiction → 환각 의심
+    entailment → 정상, neutral/contradiction → 환각 의심.
     """
-    import torch
-    from transformers import AutoModelForSequenceClassification, AutoTokenizer
+    tokenizer, model, entail_idx, device = _load_nli_model("cross-encoder/nli-deberta-v3-small")
+    sources = [b["source_text"][:400] for b in items]
+    answers = [b["answer"][:200] for b in items]
+    return _nli_batch_predict(sources, answers, tokenizer, model, entail_idx, device, batch_size, "DeBERTa-NLI")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model_name = "cross-encoder/nli-deberta-v3-small"
-    print(f"  DeBERTa-NLI 모델 로드: {model_name}")
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForSequenceClassification.from_pretrained(model_name)
-    model.to(device)
-    model.eval()
+# ── BERTScore ─────────────────────────────────────────────────────────────────
 
-    id2label = model.config.id2label
-    entail_idx = next(
-        (k for k, v in id2label.items() if "entail" in str(v).lower()), 1
+def run_bertscore_checker(items: list[dict], threshold: float = BERTSCORE_THRESHOLD) -> list[int]:
+    """xlm-roberta-large 기반 BERTScore로 환각 판단.
+
+    소스(reference)와 답변(hypothesis) 간 F1이 threshold 미만이면 환각으로 판정.
+    threshold=0.85는 고정값 — 논문에서 dev set 기반 조정 가능.
+    """
+    try:
+        from bert_score import score as bert_score_fn
+    except ImportError:
+        print("  [오류] bert-score 패키지 없음: pip install bert-score")
+        return [0] * len(items)
+
+    sources = [item["source_text"][:500] for item in items]
+    answers = [item["answer"][:300] for item in items]
+
+    print(f"  BERTScore 계산 중... (model=xlm-roberta-large, threshold={threshold})")
+    _P, _R, F1 = bert_score_fn(
+        answers,
+        sources,
+        lang="ko",
+        model_type="xlm-roberta-large",
+        verbose=False,
+        batch_size=16,
     )
-    print(f"  레이블 매핑: {id2label}  (entailment index={entail_idx})")
 
-    preds = []
-    for i in range(0, len(items), batch_size):
-        batch = items[i : i + batch_size]
-        premises   = [b["source_text"][:400] for b in batch]
-        hypotheses = [b["answer"][:200]      for b in batch]
-
-        enc = tokenizer(
-            premises, hypotheses,
-            padding=True, truncation=True, max_length=512,
-            return_tensors="pt",
-        )
-        enc = {k: v.to(device) for k, v in enc.items()}
-
-        with torch.no_grad():
-            logits = model(**enc).logits
-        label_ids = logits.argmax(dim=-1).cpu().tolist()
-
-        for label_id in label_ids:
-            preds.append(0 if label_id == entail_idx else 1)
-
-        if (i + batch_size) % 200 == 0:
-            print(f"  DeBERTa-NLI {min(i + batch_size, len(items))}/{len(items)}")
-
+    f1_list = F1.tolist()
+    preds = [1 if f < threshold else 0 for f in f1_list]
+    print(f"  평균 BERTScore F1: {sum(f1_list)/len(f1_list):.4f}")
     return preds
 
 
@@ -380,7 +294,6 @@ async def generate_rag_answer(
     context: str | None,
     model: str,
 ) -> str:
-    """RAG context 유무에 따라 LLM 답변 생성."""
     async with sem:
         if context:
             system = "당신은 대한민국 법률 상담사입니다. 주어진 참고 자료를 근거로 답변하세요."
@@ -407,9 +320,12 @@ async def generate_rag_answer(
 async def run_ablation_async(
     items: list[dict],
     llm_model: str,
-    judge_model: str,
 ) -> dict[str, dict]:
-    """4가지 Ablation 조건으로 환각 탐지율 비교."""
+    """4가지 Ablation 조건으로 환각 탐지율 비교.
+
+    A/B 조건의 생성된 답변 평가는 mDeBERTa NLI를 oracle로 사용 (LLM-free).
+    """
+    import torch
     from src.modules.ner_checker import NERFactChecker
     from src.modules.consistency_checker import ConsistencyChecker
 
@@ -417,80 +333,87 @@ async def run_ablation_async(
     sem = asyncio.Semaphore(CONCURRENCY)
     gold_labels = [1 if i["label"] == "hallucination" else 0 for i in items]
 
+    # A/B oracle용 NLI 모델 로드 (LLM 대신 판별 모델로 판정)
+    print("  [Ablation oracle] mDeBERTa NLI 로드...")
+    nli_tok, nli_mod, nli_entail_idx, nli_device = _load_nli_model(
+        "MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7"
+    )
+    sources_for_nli = [item["source_text"][:400] for item in items]
+
+    def _nli_oracle(answers: list[str]) -> list[int]:
+        return _nli_batch_predict(
+            sources_for_nli, answers,
+            nli_tok, nli_mod, nli_entail_idx, nli_device,
+            label="ablation-NLI",
+        )
+
     # ─ Condition A: RAG 없음 ──────────────────────────────────────────────────
     print("\n[Ablation A] RAG 없음 (LLM 단독)...")
-    tasks_a = [
+    answers_a = await asyncio.gather(*[
         generate_rag_answer(client, sem, item["question"], None, llm_model)
         for item in items
-    ]
-    answers_a = await asyncio.gather(*tasks_a)
+    ])
+    preds_a = _nli_oracle(answers_a)
 
     # ─ Condition B: RAG 있음 ──────────────────────────────────────────────────
     print("[Ablation B] RAG 있음...")
-    tasks_b = [
+    answers_b = await asyncio.gather(*[
         generate_rag_answer(client, sem, item["question"], item["source_text"], llm_model)
         for item in items
-    ]
-    answers_b = await asyncio.gather(*tasks_b)
+    ])
+    preds_b = _nli_oracle(answers_b)
 
-    # GPT-Judge로 각 조건 평가 (공통)
-    async def judge_answers(answers: list[str], label: str) -> list[int]:
-        print(f"  GPT-Judge 평가 ({label})...")
-        judge_items = [
-            {**items[i], "answer": a}
-            for i, a in enumerate(answers)
-        ]
-        results = [None] * len(judge_items)
+    # NLI 모델 해제 (GPU 메모리 확보)
+    del nli_mod
 
-        async def _j(idx, item):
-            results[idx] = await judge_single(client, sem, item, judge_model)
+    # ─ Condition C: RAG + SIM (실제 ConsistencyChecker 사용) ─────────────────
+    print("[Ablation C] RAG + SIM (ConsistencyChecker 실행)...")
+    sim_sem = asyncio.Semaphore(5)  # 내부 LLM 호출 11개이므로 동시 실행 제한
+    sim_checker = ConsistencyChecker()
 
-        await asyncio.gather(*[_j(i, item) for i, item in enumerate(judge_items)])
-        return [r if r is not None else 0 for r in results]
+    async def _run_sim_single(item: dict) -> tuple[int, str]:
+        async with sim_sem:
+            rag_docs = [{
+                "text": item["source_text"],
+                "content": item["source_text"],
+                "metadata": {},
+                "score": 1.0,
+            }]
+            try:
+                is_reliable, original_answer, _score, _ = await sim_checker.run(
+                    question=item["question"],
+                    rag_docs=rag_docs,
+                )
+                return (0 if is_reliable else 1), original_answer
+            except Exception as e:
+                print(f"  [ConsistencyChecker 오류] {e}")
+                return 0, ""
 
-    preds_a = await judge_answers(answers_a, "A-NoRAG")
-    preds_b = await judge_answers(answers_b, "B-RAG")
-
-    # ─ Condition C: RAG + SIM ─────────────────────────────────────────────────
-    print("[Ablation C] RAG + SIM (일관성 검사)...")
-    # SIM: 같은 질문을 3번 생성해서 답변 일관성 확인
-    # 일관성이 낮으면 (불확실한 답변) 환각 가능성 높음으로 판단
-    preds_c = []
-    for i, item in enumerate(items):
-        if i % 100 == 0:
-            print(f"  SIM {i}/{len(items)}")
-        multi_tasks = [
-            generate_rag_answer(client, sem, item["question"], item["source_text"], llm_model)
-            for _ in range(3)
-        ]
-        multi_answers = await asyncio.gather(*multi_tasks)
-        # 3개 답변 중 GPT-Judge로 각각 평가 → 2/3 이상 환각이면 양성
-        judge_multi = [
-            await judge_single(client, sem, {**item, "answer": a}, judge_model)
-            for a in multi_answers
-        ]
-        preds_c.append(1 if sum(judge_multi) >= 2 else 0)
+    results_c = await asyncio.gather(*[_run_sim_single(item) for item in items])
+    preds_c = [r[0] for r in results_c]
+    answers_c = [r[1] for r in results_c]
+    print(f"  ConsistencyChecker 완료: 환각 탐지 {sum(preds_c)}/{len(preds_c)}")
 
     # ─ Condition D: RAG + SIM + NER ───────────────────────────────────────────
     print("[Ablation D] RAG + SIM + NER (전체 파이프라인)...")
     ner_checker = NERFactChecker(model_path=NER_MODEL_PATH)
     preds_d = []
-    for i, (item, sim_pred) in enumerate(zip(items, preds_c)):
+    for i, (item, sim_pred, answer_c) in enumerate(zip(items, preds_c, answers_c)):
         if i % 100 == 0:
             print(f"  NER {i}/{len(items)}")
-        rag_chunks = [{"chunk_id": item["chunk_id"], "text": item["source_text"]}]
+        rag_chunks = [{"chunk_id": item.get("chunk_id", str(i)), "text": item["source_text"]}]
+        answer_for_ner = answer_c if answer_c else item["answer"]
         try:
-            ner_hallus = ner_checker.find_hallucinations(item["answer"], rag_chunks)
+            ner_hallus = ner_checker.find_hallucinations(answer_for_ner, rag_chunks)
             ner_pred = 1 if ner_hallus else 0
         except Exception:
             ner_pred = 0
-        # SIM OR NER 중 하나라도 양성이면 최종 양성
         preds_d.append(1 if (sim_pred == 1 or ner_pred == 1) else 0)
 
     return {
-        "A_no_rag": classification_metrics(gold_labels, preds_a),
-        "B_rag": classification_metrics(gold_labels, preds_b),
-        "C_rag_sim": classification_metrics(gold_labels, preds_c),
+        "A_no_rag":     classification_metrics(gold_labels, preds_a),
+        "B_rag":        classification_metrics(gold_labels, preds_b),
+        "C_rag_sim":    classification_metrics(gold_labels, preds_c),
         "D_rag_sim_ner": classification_metrics(gold_labels, preds_d),
     }
 
@@ -504,56 +427,66 @@ def main(skip_ablation: bool = False):
     results: dict[str, dict] = {}
 
     # ── 우리 NER 체커 ──────────────────────────────────────────────────────────
-    print("\n[1/4] 우리 NER 체커 평가...")
+    print("\n[1/5] 우리 NER 체커 평가...")
     ner_preds = run_ner_checker(items)
     results["Ours(NER)"] = classification_metrics(gold_labels, ner_preds)
     print(f"  결과: {results['Ours(NER)']}")
 
-    # ── GPT-Judge ──────────────────────────────────────────────────────────────
-    print("\n[2/4] GPT-Judge 평가...")
-    gpt_preds = run_gpt_judge(items)
-    results["GPT-4o-mini(Judge)"] = classification_metrics(gold_labels, gpt_preds)
-    print(f"  결과: {results['GPT-4o-mini(Judge)']}")
+    # ── KLUE-RoBERTa NLI (한국어 특화) ────────────────────────────────────────
+    print("\n[2/5] KLUE-NLI(klue-roberta-base-nli) 평가...")
+    klue_preds = run_klue_nli_checker(items)
+    results["KLUE-NLI(klue-roberta)"] = classification_metrics(gold_labels, klue_preds)
+    print(f"  결과: {results['KLUE-NLI(klue-roberta)']}")
 
-    # ── NLI (mDeBERTa-v3 multilingual) ────────────────────────────────────────
-    print("\n[3/4] NLI(mDeBERTa-v3-xnli-multilingual) 평가...")
+    # ── mDeBERTa NLI (다국어) ─────────────────────────────────────────────────
+    print("\n[3/5] NLI(mDeBERTa-v3-xnli-multilingual) 평가...")
     nli_preds = run_nli_checker(items)
     results["NLI(mDeBERTa-xnli)"] = classification_metrics(gold_labels, nli_preds)
     print(f"  결과: {results['NLI(mDeBERTa-xnli)']}")
 
-    # ── DeBERTa-NLI (cross-encoder/nli-deberta-v3-small) ──────────────────────
-    print("\n[4/4] DeBERTa-NLI(cross-encoder) 평가...")
+    # ── DeBERTa-NLI Cross-encoder ──────────────────────────────────────────────
+    print("\n[4/5] DeBERTa-NLI(cross-encoder) 평가...")
     deberta_preds = run_deberta_nli_checker(items)
     results["DeBERTa-NLI(cross-encoder)"] = classification_metrics(gold_labels, deberta_preds)
     print(f"  결과: {results['DeBERTa-NLI(cross-encoder)']}")
 
+    # ── BERTScore ─────────────────────────────────────────────────────────────
+    print(f"\n[5/5] BERTScore(xlm-roberta-large, threshold={BERTSCORE_THRESHOLD}) 평가...")
+    bert_preds = run_bertscore_checker(items)
+    results["BERTScore(xlm-roberta)"] = classification_metrics(gold_labels, bert_preds)
+    print(f"  결과: {results['BERTScore(xlm-roberta)']}")
+
     # ── 전체 결과 출력 ────────────────────────────────────────────────────────
-    W = 65
+    W = 70
     print("\n" + "=" * W)
-    print("=== 환각 탐지 성능 비교 (전체 800건) ===")
+    print("=== 환각 탐지 성능 비교 ===")
     print("=" * W)
-    header = f"{'모델':<28} {'Precision':>10} {'Recall':>8} {'F1':>8} {'Accuracy':>10}"
+    header = f"{'모델':<30} {'Precision':>10} {'Recall':>8} {'F1':>8} {'Accuracy':>10}"
     print(header)
     print("-" * W)
     for name, r in results.items():
-        print(f"{name:<28} {r['precision']:>10.4f} {r['recall']:>8.4f} {r['f1']:>8.4f} {r['accuracy']:>10.4f}")
+        marker = " ◀" if name == "Ours(NER)" else ""
+        print(
+            f"{name:<30} {r['precision']:>10.4f} {r['recall']:>8.4f} "
+            f"{r['f1']:>8.4f} {r['accuracy']:>10.4f}{marker}"
+        )
 
     # ── 법률 엔티티 환각 특화 비교 ────────────────────────────────────────────
-    # 우리 NER 체커의 설계 목적(조항번호·법령명 환각)에 맞는 공정 비교
-    # 대상: article_number_error + forbidden_law_injection + none(정상)
     LEGAL_ENTITY_TYPES = {"article_number_error", "forbidden_law_injection", "none"}
     legal_idx = [i for i, item in enumerate(items) if item["hallu_type"] in LEGAL_ENTITY_TYPES]
     legal_gold = [gold_labels[i] for i in legal_idx]
 
     all_preds = {
         "Ours(NER)":                  ner_preds,
-        "GPT-4o-mini(Judge)":         gpt_preds,
+        "KLUE-NLI(klue-roberta)":     klue_preds,
         "NLI(mDeBERTa-xnli)":         nli_preds,
         "DeBERTa-NLI(cross-encoder)": deberta_preds,
+        "BERTScore(xlm-roberta)":     bert_preds,
     }
-    legal_results: dict[str, dict] = {}
-    for name, preds in all_preds.items():
-        legal_results[name] = classification_metrics(legal_gold, [preds[i] for i in legal_idx])
+    legal_results: dict[str, dict] = {
+        name: classification_metrics(legal_gold, [preds[i] for i in legal_idx])
+        for name, preds in all_preds.items()
+    }
 
     n_art  = sum(1 for item in items if item["hallu_type"] == "article_number_error")
     n_law  = sum(1 for item in items if item["hallu_type"] == "forbidden_law_injection")
@@ -567,7 +500,10 @@ def main(skip_ablation: bool = False):
     print("-" * W)
     for name, r in legal_results.items():
         marker = " ◀ 우리 모델" if name == "Ours(NER)" else ""
-        print(f"{name:<28} {r['precision']:>10.4f} {r['recall']:>8.4f} {r['f1']:>8.4f} {r['accuracy']:>10.4f}{marker}")
+        print(
+            f"{name:<30} {r['precision']:>10.4f} {r['recall']:>8.4f} "
+            f"{r['f1']:>8.4f} {r['accuracy']:>10.4f}{marker}"
+        )
 
     OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     combined = {"overall": results, "legal_entity_focused": legal_results}
@@ -581,22 +517,23 @@ def main(skip_ablation: bool = False):
         print("=== Ablation Study ===")
         print("=" * 60)
         ablation_results = asyncio.run(
-            run_ablation_async(items, llm_model="gpt-4o-mini", judge_model="gpt-4o-mini")
+            run_ablation_async(items, llm_model="gpt-4o-mini")
         )
 
         header2 = f"{'조건':<20} {'Precision':>10} {'Recall':>8} {'F1':>8} {'Accuracy':>10}"
         print(header2)
         print("-" * 60)
         labels_map = {
-            "A_no_rag": "A: RAG 없음",
-            "B_rag": "B: RAG",
-            "C_rag_sim": "C: RAG+SIM",
+            "A_no_rag":      "A: RAG 없음",
+            "B_rag":         "B: RAG",
+            "C_rag_sim":     "C: RAG+SIM",
             "D_rag_sim_ner": "D: RAG+SIM+NER",
         }
         for key, name in labels_map.items():
             r = ablation_results[key]
             print(f"{name:<20} {r['precision']:>10.4f} {r['recall']:>8.4f} {r['f1']:>8.4f} {r['accuracy']:>10.4f}")
 
+        ABLATION_OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
         with ABLATION_OUT_PATH.open("w", encoding="utf-8") as f:
             json.dump(ablation_results, f, ensure_ascii=False, indent=2)
         print(f"\nAblation 결과 저장: {ABLATION_OUT_PATH}")

@@ -48,7 +48,7 @@ class NERConfig:
 
 @dataclass
 class ClarificationConfig:
-	max_retries: int = 5
+	max_retries: int = 3
 	min_score_threshold: float = float(os.getenv("CLARIFICATION_MIN_SCORE", os.getenv("LAWSGUARD_CLARIFICATION_MIN_SCORE", "3.5")))
 	fallback_message: str = "대답에 필요한 정보가 충분하지 않아 일반적인 기준으로 대답하겠습니다."
 

@@ -196,6 +196,10 @@ class NERFactChecker:
         self._corrector = AnswerCorrector()
         self._ner_model = None
         self._ner_tokenizer = None
+        self._nli_model = None       # lazy-loaded: Huffon/klue-roberta-base-nli
+        self._nli_tokenizer = None
+        self._nli_contra_idx = None
+        self._nli_device = "cpu"
 
         # 모델 경로 즉시 검증 (lazy 로딩 전 startup 단계에서 문제 노출)
         if self.use_model and self.model_path and not Path(self.model_path).exists():
@@ -526,14 +530,20 @@ class NERFactChecker:
             self._route_issue_hallucinations(answer, found_entities, candidates_by_label, context_law, route_issue_key)
         )
 
-        # Layer 2.5: 문장-RAG 의미 일관성 검사 (엔티티는 맞는데 주변 사실이 틀린 경우 탐지)
+        # Layer 2.5: NLI 기반 클레임 일관성 검사 (논리 반전·의미 모순 탐지)
         hallucinations.extend(self._validate_claim_consistency(answer, found_entities, rag_docs or []))
+
+        # Layer 2.6: 부정문 반전 패턴 검사 (의무 서술 ↔ 부정 서술 충돌)
+        hallucinations.extend(self._validate_negation_consistency(answer, rag_docs or []))
 
         # Layer 3: 범죄명-법조항 번호 정합성 검증
         hallucinations.extend(self._validate_law_articles(answer, found_entities))
 
-        # Layer 4: RAG 미지지 PENALTY 검증
-        hallucinations.extend(self._validate_penalty_claims(found_entities, candidates_by_label))
+        # Layer 3.5: 숫자 범위 조건 비교 (이상/이하/미만/초과 방향 포함)
+        hallucinations.extend(self._validate_numeric_ranges(found_entities, candidates_by_label))
+
+        # Layer 4: RAG 미지지 엔티티 검증 (LAW/CRIME/ORG/PENALTY)
+        hallucinations.extend(self._validate_ungrounded_entities(found_entities, candidates_by_label))
 
         return self._dedupe_hallucinations(hallucinations)
 
@@ -584,34 +594,57 @@ class NERFactChecker:
         context_law = law_names[0] if law_names else ""
         return candidates, context_law
 
-    # ── Layer 2.5: 문장-RAG 의미 일관성 검사 ────────────────────────────────────
+    # ── Layer 2.5: NLI 기반 클레임 일관성 검사 ──────────────────────────────────
+
+    _NLI_MODEL_NAME = "Huffon/klue-roberta-base-nli"
+    _NLI_CONTRA_THRESHOLD = 0.70   # contradiction 확률 이 이상이면 환각 판정
+
+    def _load_claim_nli(self):
+        """KLUE-RoBERTa NLI 모델 lazy 로드. 실패 시 (None, None, None) 반환."""
+        if self._nli_model == "unavailable":
+            return None, None, None
+        if self._nli_model is not None:
+            return self._nli_model, self._nli_tokenizer, self._nli_contra_idx
+        try:
+            from transformers import AutoModelForSequenceClassification, AutoTokenizer
+            device = "cuda" if (torch is not None and torch.cuda.is_available()) else "cpu"
+            tokenizer = AutoTokenizer.from_pretrained(self._NLI_MODEL_NAME)
+            model = AutoModelForSequenceClassification.from_pretrained(self._NLI_MODEL_NAME)
+            model.to(device).eval()
+            id2label = model.config.id2label
+            contra_idx = next(
+                (k for k, v in id2label.items() if "contradict" in str(v).lower()), None
+            )
+            if contra_idx is None:
+                entail_idx = next((k for k, v in id2label.items() if "entail" in str(v).lower()), 0)
+                contra_idx = 2 if entail_idx == 0 else 0
+            self._nli_model = model
+            self._nli_tokenizer = tokenizer
+            self._nli_contra_idx = contra_idx
+            self._nli_device = device
+            logger.info("NLI 모델 로드: %s (contradiction idx=%d)", self._NLI_MODEL_NAME, contra_idx)
+            return model, tokenizer, contra_idx
+        except Exception as exc:
+            logger.warning("NLI 모델 로드 실패: %s — 임베딩 유사도로 대체합니다.", exc)
+            self._nli_model = "unavailable"
+            return None, None, None
 
     def _validate_claim_consistency(
         self, answer: str, found_entities: list, rag_docs: list
     ) -> list[dict]:
-        """LAW/PENALTY/AMOUNT 엔티티를 포함한 문장이 RAG 근거와 의미적으로 일치하는지 검사.
+        """Layer 2.5: 핵심 엔티티를 포함한 문장이 RAG 근거와 모순되는지 NLI로 검사.
 
-        엔티티 텍스트 자체는 RAG에 존재하지만, 그 엔티티를 둘러싼 사실 주장이
-        RAG 내용과 어긋나는 경우(예: 조항은 맞는데 형량이 틀림)를 잡아냅니다.
+        NLI 모델이 없을 때는 임베딩 유사도(threshold 상향)로 fallback.
         """
-        if not self.enable_semantic_match:
-            return []
-        embedder = self._load_semantic_embedder()
-        if embedder is None or np is None or not rag_docs:
-            return []
-
         CLAIM_LABELS = {"LAW", "PENALTY", "AMOUNT"}
-        CLAIM_SIM_THRESHOLD = 0.45
-
         target_entities = [
             e for e in found_entities
             if (e.get("entity_group") or e.get("label")) in CLAIM_LABELS
             and len(e.get("word") or "") >= 2
         ]
-        if not target_entities:
+        if not target_entities or not rag_docs:
             return []
 
-        # RAG 청크 텍스트 수집 (최대 500자씩)
         rag_texts = []
         for doc in rag_docs:
             text = (doc.get("text") or doc.get("content", "")) if isinstance(doc, dict) else getattr(doc, "text", "")
@@ -620,20 +653,74 @@ class NERFactChecker:
         if not rag_texts:
             return []
 
-        # 문장 분리
         raw_sents = re.split(r"(?<=[.?!。？！])\s+|\n+", answer)
         sentences = [s.strip() for s in raw_sents if len(s.strip()) >= 15]
         if not sentences:
             return []
 
+        nli_model, nli_tok, contra_idx = self._load_claim_nli()
+        if nli_model is not None:
+            return self._nli_check_claims(sentences, target_entities, rag_texts, nli_model, nli_tok, contra_idx)
+        return self._embedding_check_claims(sentences, target_entities, rag_texts)
+
+    def _nli_check_claims(self, sentences, target_entities, rag_texts, model, tokenizer, contra_idx):
+        """NLI contradiction 판정으로 클레임 환각 탐지."""
+        checked: set[str] = set()
+        hallucinations: list[dict] = []
+        for entity in target_entities:
+            word = entity.get("word", "")
+            label = entity.get("entity_group") or entity.get("label")
+            for sent in sentences:
+                if word not in sent or sent in checked:
+                    continue
+                checked.add(sent)
+                best_contra = 0.0
+                best_rag = ""
+                for rag_text in rag_texts:
+                    try:
+                        enc = tokenizer(
+                            rag_text, sent,
+                            return_tensors="pt", truncation=True, max_length=512, padding=True,
+                        )
+                        enc = {k: v.to(self._nli_device) for k, v in enc.items()}
+                        with torch.no_grad():
+                            probs = torch.softmax(model(**enc).logits, dim=-1)[0]
+                        contra_prob = float(probs[contra_idx])
+                        if contra_prob > best_contra:
+                            best_contra = contra_prob
+                            best_rag = rag_text
+                    except Exception:
+                        continue
+                if best_contra >= self._NLI_CONTRA_THRESHOLD:
+                    hallucinations.append({
+                        "label": label,
+                        "wrong_word": sent[:120],
+                        "correct_word": None,
+                        "start": None,
+                        "end": None,
+                        "confidence": round(best_contra, 3),
+                        "reason_code": "nli_contradiction",
+                        "action": "soften",
+                        "reason": (
+                            f"해당 문장이 RAG 근거 문서와 모순됩니다 "
+                            f"(NLI contradiction={best_contra:.2f})"
+                        ),
+                        "nli_contradiction_score": round(best_contra, 3),
+                    })
+        return hallucinations
+
+    def _embedding_check_claims(self, sentences, target_entities, rag_texts):
+        """임베딩 유사도 기반 클레임 검사 (NLI 없을 때 fallback, threshold=0.55)."""
+        embedder = self._load_semantic_embedder()
+        if embedder is None or np is None:
+            return []
+        THRESHOLD = 0.55
         try:
             rag_embs = embedder.encode(rag_texts, normalize_embeddings=True, show_progress_bar=False)
         except Exception:
             return []
-
         checked: set[str] = set()
         hallucinations: list[dict] = []
-
         for entity in target_entities:
             word = entity.get("word", "")
             label = entity.get("entity_group") or entity.get("label")
@@ -642,30 +729,104 @@ class NERFactChecker:
                     continue
                 checked.add(sent)
                 try:
-                    sent_emb = embedder.encode(
-                        [sent], normalize_embeddings=True, show_progress_bar=False
-                    )[0]
+                    sent_emb = embedder.encode([sent], normalize_embeddings=True, show_progress_bar=False)[0]
                     max_sim = float(np.max(np.dot(rag_embs, sent_emb)))
                 except Exception:
                     continue
-                if max_sim < CLAIM_SIM_THRESHOLD:
+                if max_sim < THRESHOLD:
                     hallucinations.append({
                         "label": label,
                         "wrong_word": sent[:120],
                         "correct_word": None,
                         "start": None,
                         "end": None,
-                        "confidence": 0.65,
+                        "confidence": 0.62,
                         "reason_code": "semantically_unsupported_claim",
                         "action": "log_only",
                         "reason": (
                             f"해당 문장이 RAG 근거 문서와 의미적으로 일치하지 않습니다 "
-                            f"(유사도={max_sim:.2f} < {CLAIM_SIM_THRESHOLD})"
+                            f"(유사도={max_sim:.2f} < {THRESHOLD})"
                         ),
                         "semantic_similarity": round(max_sim, 3),
                     })
-
         return hallucinations
+
+    # ── 숫자 범위 조건 비교 ───────────────────────────────────────────────────────
+
+    _RANGE_DIRECTIONS = {"이상": "gte", "초과": "gt", "이하": "lte", "미만": "lt", "이내": "lte"}
+
+    def _parse_range_value(self, text: str) -> tuple:
+        """형량/금액 텍스트에서 (숫자값, 방향코드)를 추출. 파싱 실패 시 (None, '')."""
+        nums = re.findall(r"\d[\d,]*", text)
+        if not nums:
+            return None, ""
+        value = float(nums[0].replace(",", ""))
+        if "만원" in text or "만 원" in text:
+            value *= 10_000
+        elif "억" in text:
+            value *= 100_000_000
+        direction = next((code for word, code in self._RANGE_DIRECTIONS.items() if word in text), "")
+        return value, direction
+
+    def _validate_numeric_ranges(self, found_entities: list, candidates_by_label: dict) -> list[dict]:
+        """Layer 3.5: PENALTY/AMOUNT의 수치 및 이상/이하 방향 불일치 탐지.
+
+        Layer 1의 fuzzy 매칭은 '징역 3년 이하'와 '징역 5년 이하'를 유사하다고 볼 수 있어
+        이 레이어에서 수치 수준까지 비교합니다.
+        """
+        hallucinations = []
+        for entity in found_entities:
+            label = entity.get("entity_group") or entity.get("label")
+            if label not in {"PENALTY", "AMOUNT"}:
+                continue
+            word = entity.get("word", "")
+            if not word:
+                continue
+            candidates = candidates_by_label.get(label, [])
+            if not candidates:
+                continue
+            ans_val, ans_dir = self._parse_range_value(word)
+            if ans_val is None:
+                continue
+            for cand in candidates:
+                rag_val, rag_dir = self._parse_range_value(cand)
+                if rag_val is None:
+                    continue
+                # 수치 차이 5% 초과
+                if abs(ans_val - rag_val) / max(rag_val, 1) > 0.05:
+                    hallucinations.append({
+                        "label": label,
+                        "wrong_word": word,
+                        "correct_word": cand,
+                        "start": entity.get("start"),
+                        "end": entity.get("end"),
+                        "confidence": 0.88,
+                        "support_score": 0.0,
+                        "match_score": 0.0,
+                        "risk_level": "high",
+                        "reason_code": "numeric_value_mismatch",
+                        "action": "replace",
+                        "reason": f"수치가 RAG 근거와 다릅니다: 답변 '{word}' ≠ 근거 '{cand}'",
+                    })
+                    break
+                # 이상/이하 방향 불일치
+                if ans_dir and rag_dir and ans_dir != rag_dir:
+                    hallucinations.append({
+                        "label": label,
+                        "wrong_word": word,
+                        "correct_word": cand,
+                        "start": entity.get("start"),
+                        "end": entity.get("end"),
+                        "confidence": 0.92,
+                        "support_score": 0.0,
+                        "match_score": 0.0,
+                        "risk_level": "high",
+                        "reason_code": "range_direction_mismatch",
+                        "action": "replace",
+                        "reason": f"범위 방향이 반대입니다: 답변 '{word}' ↔ 근거 '{cand}'",
+                    })
+                    break
+        return self._dedupe_hallucinations(hallucinations)
 
     # ── 법조항 정합성 검증 ───────────────────────────────────────────────────────
 
@@ -735,33 +896,107 @@ class NERFactChecker:
 
         return self._dedupe_hallucinations(hallucinations)
 
-    def _validate_penalty_claims(self, found_entities: list, candidates_by_label: dict) -> list[dict]:
-        """PENALTY 엔티티가 RAG 근거에 없을 때 미확인으로 기록합니다."""
-        if candidates_by_label.get("PENALTY"):
-            return []  # RAG에 형량 정보 있음 - Layer 1에서 처리
+    def _validate_ungrounded_entities(self, found_entities: list, candidates_by_label: dict) -> list[dict]:
+        """Layer 4: RAG에 근거 없는 엔티티 플래그 (LAW/CRIME/ORG/PENALTY).
 
+        Layer 1은 RAG에 후보가 있을 때만 동작하므로, 후보 자체가 없는 경우를 여기서 잡습니다.
+        """
+        CONFIGS = {
+            "LAW":     ("medium", 0.72, "law_ungrounded_by_rag",     "법률명이 검색 근거 문서에서 확인되지 않았습니다."),
+            "CRIME":   ("high",   0.80, "crime_ungrounded_by_rag",   "범죄 유형이 검색 근거 문서에서 확인되지 않았습니다."),
+            "ORG":     ("medium", 0.70, "org_ungrounded_by_rag",     "기관명이 검색 근거 문서에서 확인되지 않았습니다."),
+            "PENALTY": ("medium", 0.70, "penalty_ungrounded_by_rag", "형량 정보가 검색 근거 문서에서 확인되지 않았습니다."),
+        }
         hallucinations = []
         for entity in found_entities:
-            if (entity.get("entity_group") or entity.get("label")) != "PENALTY":
+            label = entity.get("entity_group") or entity.get("label")
+            if label not in CONFIGS:
                 continue
             word = entity.get("word", "")
             if not word:
                 continue
+            if candidates_by_label.get(label):
+                continue  # RAG에 후보 있음 → Layer 1에서 이미 처리
+            risk_level, confidence, reason_code, reason = CONFIGS[label]
             hallucinations.append({
-                "label": "PENALTY",
+                "label": label,
                 "wrong_word": word,
                 "correct_word": "",
                 "start": entity.get("start"),
                 "end": entity.get("end"),
-                "confidence": 0.70,
+                "confidence": confidence,
                 "support_score": 0.0,
                 "match_score": 0.0,
-                "risk_level": "medium",
-                "reason_code": "penalty_unverified_by_rag",
+                "risk_level": risk_level,
+                "reason_code": reason_code,
                 "action": "log_only",
-                "reason": "형량 정보가 검색 근거 문서에서 확인되지 않았습니다.",
+                "reason": reason,
             })
         return self._dedupe_hallucinations(hallucinations)
+
+    # ── 부정문 반전 패턴 검사 ─────────────────────────────────────────────────────
+
+    _NEGATION_RE = re.compile(
+        r"(?:하지\s*않|않아도\s*됩|할\s*필요\s*없|면제|불필요|아니어도|아니라도|하지\s*않아도)"
+    )
+    _OBLIGATION_RE = re.compile(
+        r"(?:해야\s*합|해야\s*한다|필수|의무|반드시|필요합니다|해야만|해야\s*됩)"
+    )
+    _NEGATION_SIM_THRESHOLD = 0.72
+
+    def _validate_negation_consistency(self, answer: str, rag_docs: list) -> list[dict]:
+        """Layer 2.6: 답변의 부정 서술이 RAG 근거의 의무 서술과 충돌하는지 검사.
+
+        예) 답변: "신고하지 않아도 됩니다" / RAG: "반드시 신고해야 합니다"
+        임베딩으로 같은 주제임을 확인한 뒤 부정↔긍정 패턴 충돌을 플래그합니다.
+        """
+        embedder = self._load_semantic_embedder()
+        if embedder is None or np is None or not rag_docs:
+            return []
+
+        raw_sents = re.split(r"(?<=[.?!。？！])\s+|\n+", answer)
+        neg_sents = [s.strip() for s in raw_sents if len(s.strip()) >= 15 and self._NEGATION_RE.search(s)]
+        if not neg_sents:
+            return []
+
+        rag_pos_sents = []
+        for doc in rag_docs:
+            text = (doc.get("text") or doc.get("content", "")) if isinstance(doc, dict) else getattr(doc, "text", "")
+            for s in re.split(r"[.?!。？！\n]+", text or ""):
+                s = s.strip()
+                if len(s) >= 10 and self._OBLIGATION_RE.search(s):
+                    rag_pos_sents.append(s)
+        if not rag_pos_sents:
+            return []
+
+        try:
+            neg_embs = embedder.encode(neg_sents, normalize_embeddings=True, show_progress_bar=False)
+            pos_embs = embedder.encode(rag_pos_sents, normalize_embeddings=True, show_progress_bar=False)
+        except Exception:
+            return []
+
+        hallucinations = []
+        for neg_sent, neg_emb in zip(neg_sents, neg_embs):
+            sims = np.dot(pos_embs, neg_emb)
+            max_idx = int(np.argmax(sims))
+            max_sim = float(sims[max_idx])
+            if max_sim >= self._NEGATION_SIM_THRESHOLD:
+                hallucinations.append({
+                    "label": "LOGIC",
+                    "wrong_word": neg_sent[:120],
+                    "correct_word": rag_pos_sents[max_idx][:120],
+                    "start": None,
+                    "end": None,
+                    "confidence": round(max_sim, 3),
+                    "reason_code": "negation_reversal",
+                    "action": "soften",
+                    "reason": (
+                        f"답변의 부정 서술이 RAG 근거의 의무 서술과 충돌 가능 "
+                        f"(유사도={max_sim:.2f})"
+                    ),
+                    "similarity": round(max_sim, 3),
+                })
+        return hallucinations
 
     # ── 정규화 ────────────────────────────────────────────────────────────────
 
@@ -865,12 +1100,10 @@ class NERFactChecker:
         return float(SequenceMatcher(None, a, b).ratio())
 
     def _load_semantic_embedder(self):
-        if self._semantic_embedder is None and SentenceTransformer is not None:
-            device = "cuda" if (torch is not None and torch.cuda.is_available()) else "cpu"
+        if self._semantic_embedder is None:
             try:
-                self._semantic_embedder = SentenceTransformer(
-                    config.rag.embedding_model, device=device, local_files_only=True
-                )
+                from .embedder import get_embedder
+                self._semantic_embedder = get_embedder()
             except Exception:
                 self._semantic_embedder = None
         return self._semantic_embedder

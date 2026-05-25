@@ -203,8 +203,9 @@ class ClarificationManager:
             entity_check=repaired_entity,
         )
         repaired.missing_elements = self._missing_from_entity_check(repaired_entity)
-        # 최종 진행 가능 여부는 휴리스틱 기준을 우선한다. LLM이 과하게 낙관적인 경우를 막기 위함이다.
-        repaired.can_proceed = not self._should_requery(heuristic, context=context)
+        # LLM과 휴리스틱 모두 진행 가능해야 통과한다.
+        # LLM이 낙관적이어도 휴리스틱이 막고, 반대로 휴리스틱이 허용해도 LLM이 막으면 재질문한다.
+        repaired.can_proceed = bool(result.can_proceed) and not self._should_requery(heuristic, context=context)
         return repaired
 
     def _missing_from_entity_check(self, entity_check: dict) -> list[str]:
@@ -275,7 +276,17 @@ class ClarificationManager:
                 ctx, ("어제", "오늘", "그제", "지난", "방금", "전", "개월", "년", "월", "일", "시", "분", "경", "수업 중", "회식")
             )
         if topic == "action":
-            return _contains_any(ctx, ("추행", "성희롱", "발언", "말했", "만졌", "해고", "그만 나오", "나오지 말", "임금", "월급", "급여", "알바비", "못 받", "미지급", "일했", "근무", "근로계약서", "촬영", "몰카", "찍힌", "찍혔", "유포", "괴롭힘", "강간", "성폭행", "성폭력", "강제성교", "성적 피해", "성범죄", "협박", "동영상"))
+            # 도메인 분류어(성희롱·강간·임금 등)가 아닌 실제 행위 서술어만 신호로 사용한다.
+            # 도메인어는 _has_strong_issue_signal 에서 따로 처리한다.
+            return _contains_any(ctx, (
+                "추행", "발언", "말했", "만졌",                                        # 신체·언어 행위
+                "해고", "그만 나오", "나오지 말",                                       # 고용 종료 행위
+                "못 받", "미지급", "못 줬", "안 줬", "안 줘", "주지 않", "지급 안",       # 임금 미지급 (수급자·지급자 양방향)
+                "일했", "근무", "근로계약서",                                           # 근로 사실
+                "촬영", "몰카", "찍힌", "찍혔", "유포",                                 # 촬영·유포
+                "괴롭힘", "협박", "동영상",                                             # 기타 행위
+                "신체 접촉", "건드렸", "잡았", "끌어당겼", "노출", "유출",               # 신체 접촉·유출
+            ))
         if topic == "purpose":
             return _contains_any(ctx, ("고소", "신고", "진정", "합의", "반환", "손해배상", "처벌", "상담", "성립", "받고", "알고 싶", "구제", "어떻게 해야", "어떻게 하나", "어떡", "가능", "할 수 있", "인가요", "되나요", "되나요?", "해야 하나요"))
         if topic == "evidence":
@@ -533,15 +544,14 @@ class ClarificationManager:
         ):
             return not (has_action and has_purpose)
 
-        # 성희롱 관련: 약간 더 엄격
+        # 성희롱 관련: 상대방 + 행위 + 목적 모두 필요
         if issue in (
             "교육기관 언어적 성희롱",
             "언어적 성희롱",
             "직장 내 성희롱",
         ):
-            # 성희롱은 action + purpose만으로는 부족, 상대방 정보도 필요
             has_subject = entity_check.get("subject") or self._has_context_signal(context, "subject")
-            return not (has_action and has_purpose and (has_subject or issue != "교육기관 언어적 성희롱"))
+            return not (has_action and has_purpose and has_subject)
 
         # 노동 관련 이슈: 기본 기준
         if issue in (
@@ -557,22 +567,25 @@ class ClarificationManager:
         ):
             # 노동 사안은 LLM이 목적/주체를 과하게 낙관적으로 채우는 경우가 있어,
             # 실제 질문 문장에 드러난 신호만 기준으로 재질문 여부를 판단한다.
+            # 행위 + 목적 + (주체·시기·증거 중 하나) 세 조건이 모두 갖춰져야 진행한다.
             has_subject = self._has_context_signal(context, "subject")
             has_timing = self._has_context_signal(context, "timing")
             has_evidence = self._has_context_signal(context, "evidence")
             context_purpose = self._has_context_signal(context, "purpose") or self._has_obvious_purpose(context)
-            return not (has_action and (context_purpose or has_subject or has_timing or has_evidence))
+            return not (has_action and context_purpose and (has_subject or has_timing or has_evidence))
 
         strong_issue = self._has_strong_issue_signal(context)
+        has_subject_general = entity_check.get("subject") or self._has_context_signal(context, "subject")
 
-        if strong_issue and has_action and has_purpose:
+        # 주체(누가/누구한테) 없이는 강한 이슈 신호가 있어도 재질문한다.
+        if strong_issue and has_action and has_purpose and has_subject_general:
             return False
 
         if eval_result.legal_category == "불명확" and not has_action:
             return True
 
         if eval_result.score < self._cfg.min_score_threshold:
-            if has_action and has_purpose:
+            if has_action and has_purpose and has_subject_general:
                 return False
             return True
 
@@ -580,6 +593,9 @@ class ClarificationManager:
             return True
 
         if not has_purpose:
+            return True
+
+        if not has_subject_general:
             return True
 
         return False
@@ -636,8 +652,11 @@ class ClarificationManager:
     async def process(self, session: ClarificationSession, user_input: str) -> ClarificationResult:
         if user_input and user_input.strip():
             if session.accumulated_context:
-                if user_input.strip() not in session.accumulated_context:
-                    session.accumulated_context += "\n" + user_input.strip()
+                stripped = user_input.strip()
+                if stripped not in session.accumulated_context:
+                    # 첫 번째 메시지 이후의 입력은 재질문 응답이므로 태그로 구분한다.
+                    # 이 구조는 LLM 답변 생성 시 원본 질문과 보충 정보를 구분하는 데 쓰인다.
+                    session.accumulated_context += f"\n[보충] {stripped}"
             else:
                 session.accumulated_context = user_input.strip()
 

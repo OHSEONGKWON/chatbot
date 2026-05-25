@@ -5,9 +5,9 @@ outputs/ 디렉토리의 평가 결과 JSON을 읽어 논문용 표 5개를 출�
 
 Table 1: NER 전체 Span F1 비교 (우리 모델 vs 베이스라인 3개)
 Table 2: NER 엔티티별 F1 (공동 엔티티 + 법률 전용 엔티티)
-Table 3: RAG 검색 성능 (BM25 / Dense / Hybrid - Hit@1, NDCG@5)
-Table 4: 환각 탐지 성능 비교 - 4개 모델
-         Ours(NER) / GPT-4o-mini(Judge) / NLI(klue/roberta) / MiniCheck(Flan-T5)
+Table 3: RAG 검색 성능 (BM25 - Hit@1, Hit@3, Hit@5, MRR, NDCG@5)
+Table 4: 환각 탐지 성능 비교 - 5개 모델
+         Ours(NER) / KLUE-NLI / mDeBERTa-NLI / DeBERTa-NLI / BERTScore
 Table 5: Ablation Study (RAG없음 → RAG → RAG+SIM → RAG+SIM+NER)
 
 사용법:
@@ -142,33 +142,41 @@ def table2_ner_per_entity(data: dict, latex: bool) -> None:
 
 def table3_rag(data: dict, latex: bool) -> None:
     print("\n" + "=" * 70)
-    print("Table 3: RAG 검색 성능 비교")
+    print("Table 3: RAG 검색 성능 (BM25)")
     print("=" * 70)
 
-    best_hit  = max(r.get("hit_at_1", 0) for r in data.values())
+    best_hit1 = max(r.get("hit_at_1", 0) for r in data.values())
     best_ndcg = max(r.get("ndcg_at_5", 0) for r in data.values())
+    best_mrr  = max(r.get("mrr", 0) for r in data.values())
 
-    header = f"{'방식':<15} {'Hit@1':>10} {'NDCG@5':>10} {'N':>6}"
+    header = f"{'방식':<10} {'Hit@1':>8} {'Hit@3':>8} {'Hit@5':>8} {'MRR':>8} {'NDCG@5':>8} {'N':>5}"
     print(header)
-    sep(45)
+    sep(60)
     for name, r in data.items():
-        h = r.get("hit_at_1", 0)
-        n = r.get("ndcg_at_5", 0)
-        cnt = r.get("n", "-")
-        print(f"{name:<15} {bold(h, best_hit):>10} {bold(n, best_ndcg):>10} {cnt:>6}")
+        h1   = r.get("hit_at_1", 0)
+        h3   = r.get("hit_at_3", 0)
+        h5   = r.get("hit_at_5", 0)
+        mrr  = r.get("mrr", 0)
+        ndcg = r.get("ndcg_at_5", 0)
+        cnt  = r.get("n", "-")
+        print(
+            f"{name:<10} {bold(h1, best_hit1):>8} {h3:>8.4f} {h5:>8.4f} "
+            f"{bold(mrr, best_mrr):>8} {bold(ndcg, best_ndcg):>8} {cnt:>5}"
+        )
 
     if latex:
         print("\n[LaTeX]")
         print(r"\begin{table}[h]")
-        print(r"\caption{RAG Retrieval Performance}")
-        print(r"\begin{tabular}{lrrl}")
+        print(r"\caption{BM25 Retrieval Performance}")
+        print(r"\begin{tabular}{lrrrrrr}")
         print(r"\hline")
-        print(r"Method & Hit@1 & NDCG@5 & N \\")
+        print(r"Method & Hit@1 & Hit@3 & Hit@5 & MRR & NDCG@5 & N \\")
         print(r"\hline")
         for name, r in data.items():
             print(
-                f"{name} & {r.get('hit_at_1',0):.4f} & {r.get('ndcg_at_5',0):.4f} "
-                f"& {r.get('n', '-')} \\\\"
+                f"{name} & {r.get('hit_at_1',0):.4f} & {r.get('hit_at_3',0):.4f} "
+                f"& {r.get('hit_at_5',0):.4f} & {r.get('mrr',0):.4f} "
+                f"& {r.get('ndcg_at_5',0):.4f} & {r.get('n', '-')} \\\\"
             )
         print(r"\hline")
         print(r"\end{tabular}")
@@ -177,12 +185,9 @@ def table3_rag(data: dict, latex: bool) -> None:
 
 # ── Table 4: 환각 탐지 비교 ───────────────────────────────────────────────────
 
-def table4_hallucination(data: dict, latex: bool) -> None:
-    print("\n" + "=" * 70)
-    print("Table 4: 환각 탐지 성능 비교")
-    print("=" * 70)
-
-    numeric = {k: v for k, v in data.items() if "f1" in v}
+def _print_hallu_table(section: dict, title: str, latex: bool) -> None:
+    W = 75
+    numeric = {k: v for k, v in section.items() if isinstance(v, dict) and "f1" in v}
     if not numeric:
         print("  (결과 없음)")
         return
@@ -190,32 +195,29 @@ def table4_hallucination(data: dict, latex: bool) -> None:
     best_f1  = max(r["f1"] for r in numeric.values())
     best_rec = max(r["recall"] for r in numeric.values())
 
-    header = f"{'모델':<25} {'Precision':>10} {'Recall':>8} {'F1':>8} {'Accuracy':>10}"
+    print(title)
+    header = f"{'모델':<32} {'Precision':>10} {'Recall':>8} {'F1':>8} {'Accuracy':>10}"
     print(header)
-    sep(65)
-    for name, r in data.items():
-        if "note" in r:
-            print(f"{name:<25} {'(생략)'}")
+    sep(W)
+    for name, r in section.items():
+        if not isinstance(r, dict) or "f1" not in r:
             continue
-        p   = r.get("precision", 0)
-        rec = r.get("recall", 0)
-        f1  = r.get("f1", 0)
-        acc = r.get("accuracy", 0)
+        marker = " ◀" if "Ours" in name else ""
         print(
-            f"{name:<25} {p:>10.4f} {bold(rec, best_rec):>8} "
-            f"{bold(f1, best_f1):>8} {acc:>10.4f}"
+            f"{name:<32} {r.get('precision',0):>10.4f} {bold(r.get('recall',0), best_rec):>8} "
+            f"{bold(r.get('f1',0), best_f1):>8} {r.get('accuracy',0):>10.4f}{marker}"
         )
 
     if latex:
         print("\n[LaTeX]")
         print(r"\begin{table}[h]")
-        print(r"\caption{Hallucination Detection Performance}")
+        print(rf"\caption{{{title}}}")
         print(r"\begin{tabular}{lrrrr}")
         print(r"\hline")
         print(r"Model & Precision & Recall & F1 & Accuracy \\")
         print(r"\hline")
-        for name, r in data.items():
-            if "note" in r:
+        for name, r in section.items():
+            if not isinstance(r, dict) or "f1" not in r:
                 continue
             short = name.replace("_", r"\_")
             print(
@@ -225,6 +227,19 @@ def table4_hallucination(data: dict, latex: bool) -> None:
         print(r"\hline")
         print(r"\end{tabular}")
         print(r"\end{table}")
+
+
+def table4_hallucination(data: dict, latex: bool) -> None:
+    # data는 {"overall": {...}, "legal_entity_focused": {...}} 형태
+    overall = data.get("overall", data)  # 이전 포맷 호환
+    legal   = data.get("legal_entity_focused", {})
+
+    print("\n" + "=" * 75)
+    _print_hallu_table(overall, "Table 4: 환각 탐지 성능 비교 (전체)", latex)
+
+    if legal:
+        print("\n" + "=" * 75)
+        _print_hallu_table(legal, "Table 4b: 법률 엔티티 환각 특화 비교", latex)
 
 
 # ── Table 5: Ablation ─────────────────────────────────────────────────────────

@@ -5,6 +5,7 @@ from collections import Counter, OrderedDict
 import json
 import math
 import re
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -89,6 +90,7 @@ class LegalRetriever:
         self._avg_doc_len = 0.0
         self._query_cache: OrderedDict[tuple, list[dict[str, Any]]] = OrderedDict()
         self._query_cache_size = 64
+        self._bm25_lock = threading.Lock()
 
     async def retrieve_async(
         self,
@@ -230,23 +232,24 @@ class LegalRetriever:
     def _ensure_bm25_index(self):
         if self._bm25_index is not None:
             return
-
-        index = []
-        doc_freq = Counter()
-        total_len = 0
-        for doc in self._load_jsonl_cache():
-            metadata_text = json.dumps(doc.metadata, ensure_ascii=False)
-            tokens = self._tokenize_for_index(f"{doc.text} {metadata_text}")
-            if not tokens:
-                continue
-            counts = Counter(tokens)
-            doc_freq.update(counts.keys())
-            total_len += len(tokens)
-            index.append((doc, tokens, counts))
-
-        self._bm25_index = index
-        self._doc_freq = doc_freq
-        self._avg_doc_len = total_len / len(index) if index else 0.0
+        with self._bm25_lock:
+            if self._bm25_index is not None:
+                return
+            index = []
+            doc_freq = Counter()
+            total_len = 0
+            for doc in self._load_jsonl_cache():
+                metadata_text = json.dumps(doc.metadata, ensure_ascii=False)
+                tokens = self._tokenize_for_index(f"{doc.text} {metadata_text}")
+                if not tokens:
+                    continue
+                counts = Counter(tokens)
+                doc_freq.update(counts.keys())
+                total_len += len(tokens)
+                index.append((doc, tokens, counts))
+            self._bm25_index = index
+            self._doc_freq = doc_freq
+            self._avg_doc_len = total_len / len(index) if index else 0.0
 
     def _bm25_score(self, query_tokens: list[str], doc_tokens: list[str], token_counts: Counter) -> float:
         if not self._doc_freq or not self._bm25_index or not self._avg_doc_len:

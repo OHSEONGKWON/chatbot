@@ -419,9 +419,10 @@ def should_answer_without_requery(case_frame: CaseFrame, issue_plan: IssuePlan) 
         return True
     if case_frame.unpaid_claim and case_frame.relationship:
         return True
-    if case_frame.performed_act and (case_frame.relationship or case_frame.body_part):
+    # 신체 접촉 행위는 관계 + 신체 부위 둘 다 확인되어야 우회 허용 (하나만으로는 부족)
+    if case_frame.performed_act and case_frame.relationship and case_frame.body_part:
         return True
-    return issue_plan.confidence >= 0.78 and bool(issue_plan.primary_issue)
+    return issue_plan.confidence >= 0.85 and bool(issue_plan.primary_issue)
 
 
 def build_contract_context(case_frame: CaseFrame, issue_plan: IssuePlan, contract: AnswerContract) -> str:
