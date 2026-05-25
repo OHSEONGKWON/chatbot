@@ -107,6 +107,11 @@ class LawsGuardPipeline:
         if session is None:
             session = session_store.create(user_id, user_input)
 
+        # process() 호출 전에 이전 재질문 메시지를 캡처해야 한다.
+        # process() 내부에서 session.last_requery_message가 갱신되므로,
+        # 호출 후에 읽으면 항상 현재 재질문과 동일해서 repeated_requery=True로 오판된다.
+        previous_requery = getattr(session, "last_requery_message", "")
+
         clarify_result: ClarificationResult = await self._clarify.process(session=session, user_input=user_input)
         session_store.set(user_id, session)
 
@@ -120,7 +125,6 @@ class LawsGuardPipeline:
         can_answer_by_frame = should_answer_without_requery(case_frame, issue_plan)
 
         if clarify_result.needs_requery and not force_answer and not can_answer_by_frame:
-            previous_requery = getattr(session, "last_requery_message", "")
             repeated_requery = bool(previous_requery and previous_requery.strip() == (clarify_result.requery_message or "").strip())
             # 반복 재질문이면 더 묻지 않고 조건부 답변으로 전환한다.
             if not repeated_requery:
