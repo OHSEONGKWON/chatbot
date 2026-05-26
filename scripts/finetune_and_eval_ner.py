@@ -72,14 +72,14 @@ BASELINE_MODELS = [
         "output": BASELINES_DIR / "wikineural-finetuned",
     },
     {
-        "name": "KoELECTRA-small-modu",
-        "base": "Leo97/KoELECTRA-small-v3-modu-ner",
-        "output": BASELINES_DIR / "koelectra-small-finetuned",
+        "name": "KLUE-BERT-base",
+        "base": "klue/bert-base",
+        "output": BASELINES_DIR / "klue-bert-base-finetuned",
     },
     {
-        "name": "KoELECTRA-base-naver",
-        "base": "monologg/koelectra-base-v3-naver-ner",
-        "output": BASELINES_DIR / "koelectra-base-finetuned",
+        "name": "KLUE-RoBERTa-base",
+        "base": "klue/roberta-base",
+        "output": BASELINES_DIR / "klue-roberta-base-finetuned",
     },
 ]
 
@@ -271,7 +271,7 @@ def _run_predict(model, tokenizer, test_dataset, batch_size, seed, output_dir) -
     trainer = Trainer(
         model=model,
         args=training_args,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         compute_metrics=compute_metrics_callback,
     )
     pred_output = trainer.predict(test_dataset)
@@ -338,7 +338,7 @@ def finetune_and_evaluate(
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         compute_metrics=compute_metrics_callback,
     )
     trainer.train()
@@ -475,10 +475,15 @@ def main() -> int:
         print(f"[SKIP] 우리 모델 없음: {our_path}")
 
     # ── 베이스라인: 파인튜닝 후 평가 ────────────────────────────────────────────
+    # wikineural(XLM-RoBERTa ~270M)은 8GB VRAM에서 batch_size=8 OOM 위험 → 4로 제한
+    HEAVY_MODELS = {"Babelscape/wikineural"}
+
     for m in BASELINE_MODELS:
         model_name: str = m["name"]
         base: str = m["base"]
         output_dir: Path = m["output"]
+
+        effective_batch = max(4, args.batch_size // 2) if model_name in HEAVY_MODELS else args.batch_size
 
         # --skip-train: fine-tuned 모델이 없으면 건너뜀
         if args.skip_train and not output_dir.exists():
@@ -494,7 +499,7 @@ def main() -> int:
         bl_test_ds = LegalNERDataset(test_rows, tok, args.max_length)
 
         if args.skip_train:
-            result = evaluate_only(model_name, output_dir, tok, bl_test_ds, args.batch_size, args.seed)
+            result = evaluate_only(model_name, output_dir, tok, bl_test_ds, effective_batch, args.seed)
         else:
             bl_train_ds = LegalNERDataset(train_rows, tok, args.max_length)
             bl_val_ds = LegalNERDataset(val_rows, tok, args.max_length)
@@ -507,7 +512,7 @@ def main() -> int:
                 val_dataset=bl_val_ds,
                 test_dataset=bl_test_ds,
                 epochs=args.epochs,
-                batch_size=args.batch_size,
+                batch_size=effective_batch,
                 learning_rate=args.learning_rate,
                 seed=args.seed,
             )

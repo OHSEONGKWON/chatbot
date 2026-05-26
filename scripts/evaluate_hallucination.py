@@ -3,7 +3,7 @@
 
 평가 모델:
   - Ours             : NER 체커 (legal-ner-v3 기반)
-  - KLUE-NLI         : Huffon/klue-roberta-base-nli (한국어 NLI 파인튜닝)
+  - XLM-RoBERTa-XNLI : joeddav/xlm-roberta-large-xnli (한국어 포함 15개 언어 XNLI, GPU 호환)
   - mDeBERTa-NLI     : MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7 (다국어 NLI)
   - DeBERTa-NLI      : cross-encoder/nli-deberta-v3-small (Cross-encoder NLI)
   - BERTScore        : xlm-roberta-large 기반 의미 유사도 (threshold=0.85)
@@ -214,14 +214,14 @@ def _nli_batch_predict(
 # ── KLUE-RoBERTa NLI (한국어 특화) ───────────────────────────────────────────
 
 def run_klue_nli_checker(items: list[dict], batch_size: int = 16) -> list[int]:
-    """Huffon/klue-roberta-base-nli: 한국어 NLI 파인튜닝 모델로 환각 판단.
+    """joeddav/xlm-roberta-large-xnli: 한국어 포함 15개 언어 XNLI 파인튜닝, GPU 호환.
 
     entailment → 정상, neutral/contradiction → 환각 의심.
     """
-    tokenizer, model, entail_idx, device = _load_nli_model("Huffon/klue-roberta-base-nli")
+    tokenizer, model, entail_idx, device = _load_nli_model("joeddav/xlm-roberta-large-xnli")
     sources = [b["source_text"][:400] for b in items]
     answers = [b["answer"][:200] for b in items]
-    return _nli_batch_predict(sources, answers, tokenizer, model, entail_idx, device, batch_size, "KLUE-NLI")
+    return _nli_batch_predict(sources, answers, tokenizer, model, entail_idx, device, batch_size, "XLM-RoBERTa-XNLI")
 
 
 # ── mDeBERTa-NLI (다국어) ─────────────────────────────────────────────────────
@@ -433,10 +433,10 @@ def main(skip_ablation: bool = False):
     print(f"  결과: {results['Ours(NER)']}")
 
     # ── KLUE-RoBERTa NLI (한국어 특화) ────────────────────────────────────────
-    print("\n[2/5] KLUE-NLI(klue-roberta-base-nli) 평가...")
+    print("\n[2/5] XLM-RoBERTa-XNLI(joeddav) 평가...")
     klue_preds = run_klue_nli_checker(items)
-    results["KLUE-NLI(klue-roberta)"] = classification_metrics(gold_labels, klue_preds)
-    print(f"  결과: {results['KLUE-NLI(klue-roberta)']}")
+    results["XLM-RoBERTa-XNLI"] = classification_metrics(gold_labels, klue_preds)
+    print(f"  결과: {results['XLM-RoBERTa-XNLI']}")
 
     # ── mDeBERTa NLI (다국어) ─────────────────────────────────────────────────
     print("\n[3/5] NLI(mDeBERTa-v3-xnli-multilingual) 평가...")
@@ -478,7 +478,7 @@ def main(skip_ablation: bool = False):
 
     all_preds = {
         "Ours(NER)":                  ner_preds,
-        "KLUE-NLI(klue-roberta)":     klue_preds,
+        "XLM-RoBERTa-XNLI":          klue_preds,
         "NLI(mDeBERTa-xnli)":         nli_preds,
         "DeBERTa-NLI(cross-encoder)": deberta_preds,
         "BERTScore(xlm-roberta)":     bert_preds,
