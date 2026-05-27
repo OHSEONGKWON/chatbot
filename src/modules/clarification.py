@@ -281,7 +281,7 @@ class ClarificationManager:
             return _contains_any(ctx, (
                 "추행", "발언", "말했", "만졌",                                        # 신체·언어 행위
                 "해고", "그만 나오", "나오지 말",                                       # 고용 종료 행위
-                "못 받", "미지급", "못 줬", "안 줬", "안 줘", "주지 않", "지급 안",       # 임금 미지급 (수급자·지급자 양방향)
+                "못 받", "미지급", "못 줬", "안 줬", "안 줘", "안 주", "주지 않", "지급 안",   # 임금 미지급 (수급자·지급자 양방향)
                 "일했", "근무", "근로계약서",                                           # 근로 사실
                 "촬영", "몰카", "찍힌", "찍혔", "유포",                                 # 촬영·유포
                 "괴롭힘", "협박", "동영상",                                             # 기타 행위
@@ -333,6 +333,8 @@ class ClarificationManager:
         for topic in priority:
             if topic in ("evidence",):
                 if not self._has_context_signal(context, topic):
+                    if topic == last_topic:
+                        continue  # 이미 증거 질문을 했으면 반복하지 않음
                     return topic
                 continue
 
@@ -460,6 +462,7 @@ class ClarificationManager:
                 "어떻게 해야",
                 "어떻게 하나",
                 "어떡",
+                "어떻게",
                 "신고하고 싶",
                 "신고할 수",
                 "고소할 수",
