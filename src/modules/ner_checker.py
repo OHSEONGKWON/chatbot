@@ -607,17 +607,10 @@ class NERFactChecker:
             return self._nli_model, self._nli_tokenizer, self._nli_contra_idx
         try:
             from transformers import AutoModelForSequenceClassification, AutoTokenizer
-            # GPU 상태 검증 후 device 결정 (CUDA assertion 방지)
-            _use_cuda = False
-            if torch is not None and torch.cuda.is_available():
-                try:
-                    _t = torch.zeros(1, device="cuda")
-                    _ = (_t + 1).sum().item()
-                    torch.cuda.synchronize()
-                    _use_cuda = True
-                except Exception:
-                    _use_cuda = False
-            device = "cuda" if _use_cuda else "cpu"
+            # 내부 NLI 서브모델은 항상 CPU (LAWSGUARD_NER_NLI_CPU=0 으로 해제 가능)
+            # GPU에서 CUDA assertion을 유발해 외부 모델 로딩을 오염시키는 것을 방지
+            force_cpu = os.getenv("LAWSGUARD_NER_NLI_CPU", "1") == "1"
+            device = "cpu" if force_cpu else ("cuda" if (torch is not None and torch.cuda.is_available()) else "cpu")
             tokenizer = AutoTokenizer.from_pretrained(self._NLI_MODEL_NAME)
             model = AutoModelForSequenceClassification.from_pretrained(self._NLI_MODEL_NAME)
             model.to(device).eval()

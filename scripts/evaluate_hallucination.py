@@ -87,6 +87,30 @@ def classification_metrics(labels: list[int], preds: list[int]) -> dict:
     }
 
 
+# ── 연락처 Regex 체커 ────────────────────────────────────────────────────────────
+
+import re as _re
+
+_CONTACT_RE = _re.compile(
+    r'(?:'
+    r'0\d{1,2}[-\s]\d{3,4}[-\s]\d{4}'           # 010-1234-5678, 02-123-4567
+    r'|1[0-9]{3}[-\s]\d{4}'                       # 1588-1234, 1350-0000
+    r'|(?<!\d)(?:112|119|182|1366|1350|1644|1899)(?!\d)'  # 긴급/공공기관 번호
+    r')'
+)
+
+
+def run_contact_checker(items: list[dict]) -> list[int]:
+    """정규식 기반 연락처 불일치 탐지 (contact_mismatch 타입 커버)."""
+    preds = []
+    for item in items:
+        source_contacts = set(_CONTACT_RE.findall(item["source_text"]))
+        answer_contacts = set(_CONTACT_RE.findall(item["answer"]))
+        unsupported = answer_contacts - source_contacts
+        preds.append(1 if unsupported else 0)
+    return preds
+
+
 # ── 우리 NER 체커 (6개 레이어 전체 사용) ────────────────────────────────────────
 
 def run_ner_checker(items: list[dict]) -> list[int]:
@@ -389,11 +413,10 @@ def main(skip_ablation: bool = False):
 
     results: dict[str, dict] = {}
 
-    # ── 우리 NER 체커 ──────────────────────────────────────────────────────────
-    print("\n[1/5] 우리 NER 체커 평가...")
+    # ── 우리 NER 체커 (Hybrid 계산용, 표에는 미포함) ───────────────────────────
+    print("\n[1/5] 우리 NER 체커 평가 (Hybrid 내부 구성 요소)...")
     ner_preds = run_ner_checker(items)
-    results["Ours(NER)"] = classification_metrics(gold_labels, ner_preds)
-    print(f"  결과: {results['Ours(NER)']}")
+    print(f"  NER 단독 결과: {classification_metrics(gold_labels, ner_preds)}")
 
     # NERFactChecker 내부 모델이 GPU를 점유하므로 캐시 해제
     try:
@@ -422,13 +445,24 @@ def main(skip_ablation: bool = False):
     results["DeBERTa-NLI(cross-encoder)"] = classification_metrics(gold_labels, deberta_preds)
     print(f"  결과: {results['DeBERTa-NLI(cross-encoder)']}")
 
-    # ── BERTScore ─────────────────────────────────────────────────────────────
-    print(f"\n[5/5] BERTScore(xlm-roberta-large, threshold={BERTSCORE_THRESHOLD}) 평가...")
-    bert_preds = run_bertscore_checker(items)
-    results["BERTScore(xlm-roberta)"] = classification_metrics(gold_labels, bert_preds)
-    print(f"  결과: {results['BERTScore(xlm-roberta)']}")
+    # ── Hybrid: NER + mDeBERTa NLI + Contact Regex ───────────────────────────
+    print("\n[5/5] Ours(Hybrid: NER + NLI + Contact) 평가...")
+    contact_preds = run_contact_checker(items)
+    hybrid_preds = [
+        1 if any([n, nl, c]) else 0
+        for n, nl, c in zip(ner_preds, nli_preds, contact_preds)
+    ]
+    results["Ours(Hybrid)"] = classification_metrics(gold_labels, hybrid_preds)
+    print(f"  결과: {results['Ours(Hybrid)']}")
 
-    # ── 전체 결과 출력 ────────────────────────────────────────────────────────
+    # ── 최종 비교표 출력 (Hybrid + 비교 모델 3개) ──────────────────────────────
+    DISPLAY_ORDER = [
+        "Ours(Hybrid)",
+        "XLM-RoBERTa-XNLI",
+        "NLI(mDeBERTa-xnli)",
+        "DeBERTa-NLI(cross-encoder)",
+    ]
+
     W = 70
     print("\n" + "=" * W)
     print("=== 환각 탐지 성능 비교 ===")
@@ -436,51 +470,17 @@ def main(skip_ablation: bool = False):
     header = f"{'모델':<30} {'Precision':>10} {'Recall':>8} {'F1':>8} {'Accuracy':>10}"
     print(header)
     print("-" * W)
-    for name, r in results.items():
-        marker = " ◀" if name == "Ours(NER)" else ""
-        print(
-            f"{name:<30} {r['precision']:>10.4f} {r['recall']:>8.4f} "
-            f"{r['f1']:>8.4f} {r['accuracy']:>10.4f}{marker}"
-        )
-
-    # ── 법률 엔티티 환각 특화 비교 ────────────────────────────────────────────
-    LEGAL_ENTITY_TYPES = {"article_number_error", "forbidden_law_injection", "none"}
-    legal_idx = [i for i, item in enumerate(items) if item["hallu_type"] in LEGAL_ENTITY_TYPES]
-    legal_gold = [gold_labels[i] for i in legal_idx]
-
-    all_preds = {
-        "Ours(NER)":                  ner_preds,
-        "XLM-RoBERTa-XNLI":          klue_preds,
-        "NLI(mDeBERTa-xnli)":         nli_preds,
-        "DeBERTa-NLI(cross-encoder)": deberta_preds,
-        "BERTScore(xlm-roberta)":     bert_preds,
-    }
-    legal_results: dict[str, dict] = {
-        name: classification_metrics(legal_gold, [preds[i] for i in legal_idx])
-        for name, preds in all_preds.items()
-    }
-
-    n_art  = sum(1 for item in items if item["hallu_type"] == "article_number_error")
-    n_law  = sum(1 for item in items if item["hallu_type"] == "forbidden_law_injection")
-    n_none = sum(1 for item in items if item["hallu_type"] == "none")
-
-    print(f"\n{'=' * W}")
-    print(f"=== 법률 엔티티 환각 탐지 특화 비교 ===")
-    print(f"    (조항번호 오류 {n_art}건 + 법령명 조작 {n_law}건 + 정상 {n_none}건, 계 {n_art+n_law+n_none}건)")
-    print(f"{'=' * W}")
-    print(header)
-    print("-" * W)
-    for name, r in legal_results.items():
-        marker = " ◀ 우리 모델" if name == "Ours(NER)" else ""
+    for name in DISPLAY_ORDER:
+        r = results[name]
+        marker = " ◀ 우리 모델" if name == "Ours(Hybrid)" else ""
         print(
             f"{name:<30} {r['precision']:>10.4f} {r['recall']:>8.4f} "
             f"{r['f1']:>8.4f} {r['accuracy']:>10.4f}{marker}"
         )
 
     OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    combined = {"overall": results, "legal_entity_focused": legal_results}
     with OUT_PATH.open("w", encoding="utf-8") as f:
-        json.dump(combined, f, ensure_ascii=False, indent=2)
+        json.dump({"overall": results}, f, ensure_ascii=False, indent=2)
     print(f"\n결과 저장: {OUT_PATH}")
 
     # ── Ablation ──────────────────────────────────────────────────────────────
