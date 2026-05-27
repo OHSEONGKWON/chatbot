@@ -15,6 +15,7 @@ RAG 검색 성능 평가 스크립트 (Phase 3 - Step 2).
   python scripts/evaluate_rag_comprehensive.py --eval golden           # 자동 키워드 후보
   python scripts/evaluate_rag_comprehensive.py --top-k 10             # 검색 범위 확장
   python scripts/evaluate_rag_comprehensive.py --skip-zero            # relevance=0 항목 제외
+  python scripts/evaluate_rag_comprehensive.py --compare-all          # BM25 vs Dense(E5) vs BM25+Reranker 동시 비교 (논문용)
 """
 
 from __future__ import annotations
@@ -30,6 +31,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 from src.modules.rag import retriever
+
+OUTPUT_PATH = REPO_ROOT / "outputs" / "rag_eval_results.json"
 
 # ── 파일 경로 ─────────────────────────────────────────────────────────────────
 EVAL_FILES = {
@@ -299,6 +302,253 @@ def _print_failures(results: list[dict], k: int = 10) -> None:
         print(f"      retrieved: {r['retrieved_ids'][:2]}")
 
 
+# ── Dense(E5) 인메모리 검색기 ─────────────────────────────────────────────────
+
+class DenseRetriever:
+    """JSONL 코퍼스를 dense 임베딩으로 인덱싱하고 코사인 유사도로 검색.
+
+    model_type:
+      "e5"   → intfloat/multilingual-e5-large  (query: / passage: prefix 사용)
+      "bgem3" → BAAI/bge-m3                     (prefix 없음, 자체 정규화)
+    """
+
+    # E5는 query/passage prefix 필요, BGE-M3는 불필요
+    _QUERY_PREFIX  = {"e5": "query: ",   "bgem3": ""}
+    _PASSAGE_PREFIX = {"e5": "passage: ", "bgem3": ""}
+    _MODEL_IDS = {
+        "e5":    "intfloat/multilingual-e5-large",
+        "bgem3": "BAAI/bge-m3",
+    }
+
+    def __init__(self, model_type: str = "e5"):
+        assert model_type in ("e5", "bgem3"), f"지원하지 않는 모델: {model_type}"
+        self._model_type = model_type
+        self._docs: list[dict[str, Any]] = []
+        self._embeddings = None
+        self._model = None
+
+    def _cache_path(self, jsonl_paths: list[Path]) -> Path:
+        """JSONL 파일 목록과 모델 타입으로 캐시 파일 경로 결정."""
+        import hashlib
+        key = self._model_type + "|" + "|".join(str(p) for p in sorted(jsonl_paths))
+        h = hashlib.md5(key.encode()).hexdigest()[:10]
+        return REPO_ROOT / "outputs" / f"dense_index_{self._model_type}_{h}.pt"
+
+    def _cache_valid(self, cache_path: Path, jsonl_paths: list[Path]) -> bool:
+        """캐시가 있고, JSONL 파일보다 최신이면 True."""
+        if not cache_path.exists():
+            return False
+        cache_mtime = cache_path.stat().st_mtime
+        return all(not p.exists() or p.stat().st_mtime <= cache_mtime for p in jsonl_paths)
+
+    def build_index(self, jsonl_paths: list[Path]) -> None:
+        import torch
+        from sentence_transformers import SentenceTransformer
+
+        label = self._MODEL_IDS[self._model_type]
+        cache_path = self._cache_path(jsonl_paths)
+
+        # ── 캐시 로드 시도 ────────────────────────────────────────────────────
+        if self._cache_valid(cache_path, jsonl_paths):
+            print(f"  [Dense/{label}] 캐시 로드: {cache_path.name}")
+            saved = torch.load(cache_path, map_location="cpu", weights_only=False)
+            self._docs = saved["docs"]
+            self._embeddings = saved["embeddings"]
+            print(f"  [Dense/{label}] 캐시에서 {len(self._docs):,}개 문서 / 임베딩 {self._embeddings.shape} 복원")
+            # 모델은 retrieve 시 사용하지 않으므로 불필요 (점수 계산만 텐서 연산)
+            return
+
+        # ── 문서 로딩 ─────────────────────────────────────────────────────────
+        print(f"  [Dense/{label}] 문서 로딩 중...")
+        for path in jsonl_paths:
+            if not path.exists():
+                continue
+            with path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    row = json.loads(line)
+                    if row.get("text") and row.get("chunk_id"):
+                        self._docs.append(row)
+        print(f"  [Dense/{label}] 총 {len(self._docs):,}개 문서 로드 완료")
+
+        # ── 임베딩 생성 ───────────────────────────────────────────────────────
+        print(f"  [Dense/{label}] 모델 로딩 및 임베딩 생성 중 (시간이 걸립니다)...")
+        try:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            if device == "cuda":
+                print(f"  [Dense/{label}] GPU: {torch.cuda.get_device_name(0)}")
+            else:
+                print(f"  [Dense/{label}] CPU 모드 (CUDA 없음) — 느릴 수 있음")
+            model_id = self._MODEL_IDS[self._model_type]
+            try:
+                self._model = SentenceTransformer(model_id, device=device, local_files_only=True)
+            except Exception:
+                print(f"  [Dense/{label}] 로컬 캐시 없음 → HuggingFace에서 다운로드 중...")
+                self._model = SentenceTransformer(model_id, device=device)
+            prefix = self._PASSAGE_PREFIX[self._model_type]
+            texts = [f"{prefix}{d['text'][:512]}" for d in self._docs]
+            self._embeddings = self._model.encode(
+                texts, batch_size=32, show_progress_bar=True,
+                normalize_embeddings=True, convert_to_tensor=True,
+            )
+            print(f"  [Dense/{label}] 임베딩 완료: {self._embeddings.shape}")
+
+            # ── 캐시 저장 ─────────────────────────────────────────────────────
+            cache_path.parent.mkdir(exist_ok=True)
+            torch.save({"docs": self._docs, "embeddings": self._embeddings.cpu()}, cache_path)
+            print(f"  [Dense/{label}] 임베딩 캐시 저장: {cache_path.name}")
+        except Exception as e:
+            print(f"  [Dense/{label}] 모델 로드 실패: {e}")
+            self._embeddings = None
+
+    @staticmethod
+    def _doc_matches_category(doc: dict[str, Any], category: str) -> bool:
+        """BM25 _metadata_boost와 동일한 기준으로 카테고리 매칭 여부 반환."""
+        meta = doc.get("metadata") or {}
+        title = " ".join(
+            str(meta.get(key) or "")
+            for key in ["law_name", "source_file", "article_title", "section_label"]
+        )
+        if category == "노동":
+            return any(k in title for k in ["근로기준법", "노동", "고용"])
+        if category == "성폭력":
+            return any(k in title for k in ["성희롱", "성폭력", "강제추행", "강간"])
+        return True
+
+    def retrieve(self, query: str, top_k: int = 5, category: str | None = None) -> list[dict[str, Any]]:
+        if self._embeddings is None or self._model is None:
+            return []
+        import torch
+
+        # BM25와 동일한 조건: 카테고리 메타데이터 기반 필터링
+        if category:
+            doc_indices = [
+                i for i, d in enumerate(self._docs)
+                if self._doc_matches_category(d, category)
+            ]
+            if not doc_indices:
+                doc_indices = list(range(len(self._docs)))  # 매칭 없으면 전체 폴백
+        else:
+            doc_indices = list(range(len(self._docs)))
+
+        prefix = self._QUERY_PREFIX[self._model_type]
+        q_emb = self._model.encode(
+            f"{prefix}{query}", normalize_embeddings=True, convert_to_tensor=True
+        )
+        filtered_emb = self._embeddings[doc_indices]
+        scores = torch.matmul(filtered_emb, q_emb).cpu().tolist()
+        ranked = sorted(zip(doc_indices, scores), key=lambda x: x[1], reverse=True)[:top_k]
+        results = []
+        for idx, score in ranked:
+            doc = self._docs[idx].copy()
+            doc["score"] = score
+            results.append(doc)
+        return results
+
+
+def _summary_to_paper_format(summary: dict, label: str) -> dict:
+    """evaluate() 결과 summary → generate_paper_tables.py 형식으로 변환."""
+    return {
+        "hit_at_1": summary.get("hit@1", 0.0),
+        "hit_at_3": summary.get("hit@3", 0.0),
+        "hit_at_5": summary.get("hit@5", 0.0),
+        "mrr":      summary.get("mrr", 0.0),
+        "ndcg_at_5": summary.get("ndcg@5", 0.0),
+        "n":        summary.get("n", 0),
+    }
+
+
+def _eval_dense(label: str, dense: DenseRetriever, items: list[dict[str, Any]], top_k: int) -> dict | None:
+    """DenseRetriever 인스턴스로 items를 평가해 paper-format 결과를 반환."""
+    if dense._embeddings is None:
+        print(f"  [SKIP] {label} 임베딩 없음 — 건너뜁니다.")
+        return None
+    results = []
+    mismatch = 0
+    for item in items:
+        docs = dense.retrieve(item["query"], top_k=top_k, category=item.get("category"))
+        ret_ids = [_normalize_id(str(d.get("chunk_id", ""))) for d in docs]
+        golden  = {_normalize_id(k): v for k, v in item["golden_doc_ids"].items()}
+        golden_set = set(golden.keys())
+        if not any(i in golden_set for i in ret_ids):
+            mismatch += 1
+        results.append({
+            "hit@1":  _hit_at_k(ret_ids, golden_set, 1),
+            "hit@3":  _hit_at_k(ret_ids, golden_set, 3),
+            "hit@5":  _hit_at_k(ret_ids, golden_set, 5),
+            "mrr":    _mrr(ret_ids, golden_set),
+            "ndcg@5": _ndcg_at_k(ret_ids, golden, 5),
+        })
+    n = len(results)
+    def avg(k): return round(sum(r[k] for r in results) / n, 4)
+    summary = {k: avg(k) for k in ("hit@1", "hit@3", "hit@5", "mrr", "ndcg@5")}
+    summary["n"] = n
+    s = summary
+    print(f"  Hit@1={s['hit@1']:.4f}  MRR={s['mrr']:.4f}  NDCG@5={s['ndcg@5']:.4f}  (n={n})")
+    if mismatch:
+        print(f"  [경고] chunk_id 불일치 {mismatch}/{n}개")
+    return _summary_to_paper_format(summary, label)
+
+
+def compare_all(items: list[dict[str, Any]], top_k: int) -> None:
+    """BM25 / Dense(E5) / Dense(BGE-M3) 세 방법을 동일 데이터로 평가 후 저장."""
+    from src.config import config
+
+    all_results: dict[str, dict] = {}
+    W = 65
+    jsonl_paths = [Path(p) for p in config.rag.jsonl_paths]
+
+    # ── 1. BM25 ──────────────────────────────────────────────────────────────
+    print(f"\n{'─'*W}")
+    print("[1/3] BM25 평가 중...")
+    out_bm25 = evaluate(items, top_k=top_k, rerank=False)
+    s = out_bm25["summary"]
+    all_results["BM25"] = _summary_to_paper_format(s, "BM25")
+    print(f"  Hit@1={s['hit@1']:.4f}  MRR={s['mrr']:.4f}  NDCG@5={s['ndcg@5']:.4f}  (n={s['n']})")
+
+    # ── 2. Dense(E5) ─────────────────────────────────────────────────────────
+    print(f"\n{'─'*W}")
+    print("[2/3] Dense(E5) 평가 중...")
+    e5 = DenseRetriever(model_type="e5")
+    e5.build_index(jsonl_paths)
+    r = _eval_dense("Dense(E5)", e5, items, top_k)
+    if r:
+        all_results["Dense(E5)"] = r
+    del e5  # VRAM 확보 후 다음 모델 로드
+
+    # ── 3. Dense(BGE-M3) ─────────────────────────────────────────────────────
+    print(f"\n{'─'*W}")
+    print("[3/3] Dense(BGE-M3) 평가 중...")
+    bgem3 = DenseRetriever(model_type="bgem3")
+    bgem3.build_index(jsonl_paths)
+    r = _eval_dense("Dense(BGE-M3)", bgem3, items, top_k)
+    if r:
+        all_results["Dense(BGE-M3)"] = r
+    del bgem3
+
+    # ── 결과 출력 ─────────────────────────────────────────────────────────────
+    print(f"\n{'='*W}")
+    print("RAG 검색 성능 비교 (동일 쿼리셋 · 동일 코퍼스)")
+    print(f"{'='*W}")
+    print(f"{'방법':<20} {'Hit@1':>7} {'Hit@3':>7} {'Hit@5':>7} {'MRR':>7} {'NDCG@5':>8} {'N':>5}")
+    print(f"{'─'*W}")
+    for method, r in all_results.items():
+        marker = " ◀ 채택" if method == "BM25" else ""
+        print(
+            f"{method:<20} {r['hit_at_1']:>7.4f} {r['hit_at_3']:>7.4f} {r['hit_at_5']:>7.4f}"
+            f" {r['mrr']:>7.4f} {r['ndcg_at_5']:>8.4f} {r['n']:>5}{marker}"
+        )
+    print(f"{'='*W}")
+
+    # ── outputs/rag_eval_results.json 저장 ───────────────────────────────────
+    OUTPUT_PATH.parent.mkdir(exist_ok=True)
+    with OUTPUT_PATH.open("w", encoding="utf-8") as f:
+        json.dump(all_results, f, ensure_ascii=False, indent=2)
+    print(f"\n결과 저장: {OUTPUT_PATH}")
+
+
 # ── 메인 ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -320,7 +570,21 @@ def main() -> None:
                         help="Cross-Encoder 모델명")
     parser.add_argument("--save", action="store_true",
                         help="results/ 폴더에 JSON 저장")
+    parser.add_argument("--compare-all", action="store_true",
+                        help="BM25 / Dense(E5) / BM25+Reranker 동시 비교 후 outputs/rag_eval_results.json 저장 (논문용)")
     args = parser.parse_args()
+
+    # ── --compare-all: 세 방법 동시 비교 ─────────────────────────────────────
+    if args.compare_all:
+        eval_key = args.eval if args.eval != "remapped" else "golden_reviewed"
+        eval_path = EVAL_FILES[eval_key]
+        if not eval_path.exists():
+            print(f"[오류] 평가셋 파일 없음: {eval_path}")
+            sys.exit(1)
+        items = _load_golden(eval_path, args.skip_zero)
+        print(f"평가셋: {eval_path.name}  ({len(items)}개 쿼리)  top_k={args.top_k}")
+        compare_all(items, top_k=args.top_k)
+        return
 
     eval_path = EVAL_FILES[args.eval]
     if not eval_path.exists():

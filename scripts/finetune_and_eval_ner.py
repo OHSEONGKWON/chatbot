@@ -160,12 +160,13 @@ class LegalNERDataset(Dataset):
 
 # ── 메트릭 계산 ───────────────────────────────────────────────────────────────
 
-def ids_to_entities(label_ids: list[int]) -> set[tuple[str, int, int]]:
+def ids_to_entities(label_ids: list[int], id2label: dict | None = None) -> set[tuple[str, int, int]]:
+    _map = id2label if id2label is not None else ID2LABEL
     entities: set[tuple[str, int, int]] = set()
     start = None
     current = None
     for idx, label_id in enumerate(label_ids + [LABEL2ID["O"]]):
-        label = ID2LABEL.get(int(label_id), "O") if label_id != -100 else "O"
+        label = _map.get(int(label_id), "O") if label_id != -100 else "O"
         if label == "O":
             if current is not None:
                 entities.add((current, start, idx))
@@ -202,7 +203,7 @@ def compute_metrics_callback(eval_pred):
     }
 
 
-def compute_span_f1_by_type(preds: list[list[int]], labels: list[list[int]]) -> dict:
+def compute_span_f1_by_type(preds: list[list[int]], labels: list[list[int]], pred_id2label: dict | None = None) -> dict:
     """테스트셋 span-level F1: 엔티티 유형별 + macro + micro."""
     tp = {t: 0 for t in ENTITY_TYPES}
     fp = {t: 0 for t in ENTITY_TYPES}
@@ -211,7 +212,7 @@ def compute_span_f1_by_type(preds: list[list[int]], labels: list[list[int]]) -> 
     for pred_row, label_row in zip(preds, labels):
         valid_preds = [int(p) for p, l in zip(pred_row, label_row) if l != -100]
         valid_labels = [int(l) for l in label_row if l != -100]
-        pred_ents = ids_to_entities(valid_preds)
+        pred_ents = ids_to_entities(valid_preds, pred_id2label)
         gold_ents = ids_to_entities(valid_labels)
         for t in ENTITY_TYPES:
             p_t = {e for e in pred_ents if e[0] == t}
@@ -261,7 +262,7 @@ def _flatten_for_paper(metrics: dict) -> dict:
 
 # ── 훈련 / 평가 ───────────────────────────────────────────────────────────────
 
-def _run_predict(model, tokenizer, test_dataset, batch_size, seed, output_dir) -> dict:
+def _run_predict(model, tokenizer, test_dataset, batch_size, seed, output_dir, model_id2label: dict | None = None) -> dict:
     training_args = TrainingArguments(
         output_dir=str(output_dir),
         per_device_eval_batch_size=batch_size,
@@ -280,10 +281,10 @@ def _run_predict(model, tokenizer, test_dataset, batch_size, seed, output_dir) -
         return {}
     preds = pred_output.predictions.argmax(-1).tolist()
     labels_list = pred_output.label_ids.tolist()
-    raw = compute_span_f1_by_type(preds, labels_list)
+    raw = compute_span_f1_by_type(preds, labels_list, pred_id2label=model_id2label)
     model.cpu()
     torch.cuda.empty_cache()
-    return _flatten_for_paper(raw)
+    return raw
 
 
 def finetune_and_evaluate(
@@ -369,7 +370,9 @@ def evaluate_only(
     model = AutoModelForTokenClassification.from_pretrained(
         str(model_path), local_files_only=local_files_only
     )
-    return _run_predict(model, tokenizer, test_dataset, batch_size, seed, model_path)
+    # 모델 고유의 id2label 사용 (스크립트 전역 ID2LABEL과 순서가 다를 수 있음)
+    model_id2label = {int(k): v for k, v in model.config.id2label.items()}
+    return _run_predict(model, tokenizer, test_dataset, batch_size, seed, model_path, model_id2label=model_id2label)
 
 
 def _load_tokenizer(source: str, local: bool) -> AutoTokenizer:
@@ -529,8 +532,9 @@ def main() -> int:
 
     out_path = REPO_ROOT / "outputs" / "ner_compare_results.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    flat_results = {name: _flatten_for_paper(r) for name, r in all_results.items()}
     with out_path.open("w", encoding="utf-8") as f:
-        json.dump(all_results, f, ensure_ascii=False, indent=2)
+        json.dump(flat_results, f, ensure_ascii=False, indent=2)
     print(f"\n결과 저장: {out_path}")
     return 0
 

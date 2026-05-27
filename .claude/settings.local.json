@@ -26,7 +26,8 @@
       "PowerShell(python scripts/evaluate_rag_comprehensive.py --eval golden_reviewed --skip-zero --compare --rerank-model llm --save 2>&1)",
       "Bash(python -c ' *)",
       "Bash(python tests/manual_pipeline_test.py)",
-      "Bash(python -c \"from src.config import config; print\\('API key set:', bool\\(config.llm.api_key\\)\\); print\\('model:', config.llm.model_name\\)\")"
+      "Bash(python -c \"from src.config import config; print\\('API key set:', bool\\(config.llm.api_key\\)\\); print\\('model:', config.llm.model_name\\)\")",
+      "Bash(python scripts/finetune_and_eval_ner.py --skip-train)"
     ]
   }
 }
