@@ -330,15 +330,25 @@ class ClarificationManager:
         else:
             priority = ("subject", "action", "purpose", "timing", "evidence")
 
-        for topic in priority:
-            if topic in ("evidence",):
-                if not self._has_context_signal(context, topic):
-                    if topic == last_topic:
-                        continue  # 이미 증거 질문을 했으면 반복하지 않음
-                    return topic
-                continue
+        _context_only_issues = (
+            "임금체불", "최저임금", "주휴수당", "연장·야간·휴일수당",
+            "부당해고", "근로계약서 미작성", "퇴직금", "직장 내 괴롭힘", "산재",
+            "교육기관 언어적 성희롱", "언어적 성희롱", "직장 내 성희롱",
+        )
+        use_context_only = issue in _context_only_issues
 
-            if not entity_check.get(topic, False) and not self._has_context_signal(context, topic):
+        for topic in priority:
+            if use_context_only:
+                has_topic = (
+                    self._has_context_signal(context, topic)
+                    or (topic == "purpose" and self._has_obvious_purpose(context))
+                )
+            elif topic in ("evidence",):
+                has_topic = self._has_context_signal(context, topic)
+            else:
+                has_topic = bool(entity_check.get(topic, False)) or self._has_context_signal(context, topic)
+
+            if not has_topic:
                 if topic == last_topic:
                     continue
                 return topic
