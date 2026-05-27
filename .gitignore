@@ -9,3 +9,9 @@ pytest-cache-files-*/
 
 # 학습된 모델 (파일 크기 초과로 GitHub 업로드 불가)
 outputs/
+
+# 런타임 생성 파일 (버전 관리 불필요)
+data/sessions.db
+data/chat_history.db
+output/*.jpeg
+output/*.png
