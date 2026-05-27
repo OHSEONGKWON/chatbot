@@ -87,95 +87,58 @@ def classification_metrics(labels: list[int], preds: list[int]) -> dict:
     }
 
 
-# ── 우리 NER 체커 ─────────────────────────────────────────────────────────────
-
-def _extract_entities(text: str, tokenizer, model, id2label: dict, device) -> list[tuple[str, str]]:
-    import torch
-    enc = tokenizer(
-        text, return_tensors="pt", truncation=True, max_length=512,
-        return_offsets_mapping=True,
-    )
-    offset_mapping = enc.pop("offset_mapping")[0].tolist()
-    enc = {k: v.to(device) for k, v in enc.items()}
-
-    with torch.no_grad():
-        logits = model(**enc).logits
-    pred_ids = logits.argmax(-1)[0].tolist()
-    tokens = tokenizer.convert_ids_to_tokens(enc["input_ids"][0].tolist())
-
-    entities: list[tuple[str, str]] = []
-    cur_tokens: list[str] = []
-    cur_type: str | None = None
-
-    for token, pred_id, (char_s, char_e) in zip(tokens, pred_ids, offset_mapping):
-        if char_s == char_e:
-            if cur_tokens:
-                entities.append(("".join(cur_tokens), cur_type))
-                cur_tokens, cur_type = [], None
-            continue
-
-        label = id2label.get(pred_id, "O")
-        clean = token.replace("##", "").replace("▁", "")
-
-        if label.startswith("B-"):
-            if cur_tokens:
-                entities.append(("".join(cur_tokens), cur_type))
-            cur_tokens = [clean]
-            cur_type = label[2:]
-        elif label.startswith("I-") and cur_type == label[2:]:
-            cur_tokens.append(clean)
-        else:
-            if cur_tokens:
-                entities.append(("".join(cur_tokens), cur_type))
-            cur_tokens, cur_type = [], None
-
-    if cur_tokens:
-        entities.append(("".join(cur_tokens), cur_type))
-
-    return [(t, tp) for t, tp in entities if t.strip()]
-
+# ── 우리 NER 체커 (6개 레이어 전체 사용) ────────────────────────────────────────
 
 def run_ner_checker(items: list[dict]) -> list[int]:
-    """legal-ner-v3로 법률 엔티티(LAW/CRIME/PENALTY)가 소스에 없으면 환각으로 판정."""
-    import torch
-    from transformers import AutoModelForTokenClassification, AutoTokenizer
+    """실제 NERFactChecker 6개 레이어 전체로 환각 탐지.
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"  NER 모델 로드: {NER_MODEL_PATH}")
-    tokenizer = AutoTokenizer.from_pretrained(NER_MODEL_PATH)
-    model = AutoModelForTokenClassification.from_pretrained(NER_MODEL_PATH)
-    model.to(device)
-    model.eval()
-    id2label = model.config.id2label
+    Layer 1  : 엔티티 ↔ RAG 후보 fuzzy/semantic 매칭
+    Layer 2  : 이슈-도메인 법률 교차 검증 (금지 법률)
+    Layer 2.5: KLUE-RoBERTa NLI contradiction 검사
+    Layer 2.6: 부정문 반전 패턴 (의무 서술 충돌)
+    Layer 3  : 범죄명-법조항 번호 정합성
+    Layer 3.5: 수치 범위 및 이상/이하 방향 비교
+    Layer 4  : RAG 미지지 엔티티 플래그
+    """
+    from src.modules.ner_checker import NERFactChecker
 
-    HALLUCINATION_TYPES = {"LAW", "CRIME", "PENALTY"}
+    print(f"  NERFactChecker 초기화 (6-layer): {NER_MODEL_PATH}")
+    checker = NERFactChecker(model_path=NER_MODEL_PATH)
 
     preds = []
     for i, item in enumerate(items):
         if i % 100 == 0:
             print(f"  NER {i}/{len(items)}")
 
-        answer_ents = _extract_entities(item["answer"], tokenizer, model, id2label, device)
-        source_ents = _extract_entities(item["source_text"][:600], tokenizer, model, id2label, device)
-        source_texts = {t for t, _ in source_ents}
-
-        is_hallucination = any(
-            et in HALLUCINATION_TYPES and ev not in source_texts
-            for ev, et in answer_ents
-        )
-        preds.append(1 if is_hallucination else 0)
+        rag_docs = [{"text": item["source_text"], "metadata": {}}]
+        hallucinations = checker.find_hallucinations(item["answer"], rag_docs)
+        preds.append(1 if hallucinations else 0)
 
     return preds
 
 
 # ── 공통 NLI 유틸 ─────────────────────────────────────────────────────────────
 
+def _gpu_healthy() -> bool:
+    """GPU가 실제로 사용 가능한 상태인지 간단한 텐서 연산으로 검증."""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return False
+        t = torch.zeros(1, device="cuda")
+        _ = (t + 1).sum().item()
+        torch.cuda.synchronize()
+        return True
+    except Exception:
+        return False
+
+
 def _load_nli_model(model_name: str):
     import torch
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"  NLI 모델 로드: {model_name}")
+    device = torch.device("cuda" if _gpu_healthy() else "cpu")
+    print(f"  NLI 모델 로드: {model_name}  (device={device})")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForSequenceClassification.from_pretrained(model_name)
     model.to(device).eval()
@@ -431,6 +394,15 @@ def main(skip_ablation: bool = False):
     ner_preds = run_ner_checker(items)
     results["Ours(NER)"] = classification_metrics(gold_labels, ner_preds)
     print(f"  결과: {results['Ours(NER)']}")
+
+    # NERFactChecker 내부 모델이 GPU를 점유하므로 캐시 해제
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+    except Exception:
+        pass
 
     # ── KLUE-RoBERTa NLI (한국어 특화) ────────────────────────────────────────
     print("\n[2/5] XLM-RoBERTa-XNLI(joeddav) 평가...")
