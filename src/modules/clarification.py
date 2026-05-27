@@ -263,6 +263,27 @@ class ClarificationManager:
         if _contains_any(t, ("해고", "잘렸", "그만 나오", "부당해고", "권고사직")):
             return "부당해고"
 
+        if _contains_any(t, ("근로계약서",)):
+            return "근로계약서 미작성"
+
+        if _contains_any(t, ("주휴수당",)):
+            return "주휴수당"
+
+        if _contains_any(t, ("최저임금", "시급 미달")):
+            return "최저임금"
+
+        if _contains_any(t, ("퇴직금",)):
+            return "퇴직금"
+
+        if _contains_any(t, ("직장 내 괴롭힘", "직장내 괴롭힘", "직장 내괴롭힘")):
+            return "직장 내 괴롭힘"
+
+        if _contains_any(t, ("산재", "산업재해", "업무상 재해", "업무상재해")):
+            return "산재"
+
+        if _contains_any(t, ("야간수당", "연장수당", "휴일수당", "초과근무수당", "수당을 안", "수당이 안")):
+            return "연장·야간·휴일수당"
+
         if "성희롱" in legal_category:
             return "언어적 성희롱"
         return "일반"
@@ -321,8 +342,11 @@ class ClarificationManager:
 
         if issue in ("교육기관 언어적 성희롱", "언어적 성희롱"):
             priority = ("purpose", "evidence", "action", "subject")
-        elif issue == "임금체불":
-            priority = ("purpose", "evidence", "action", "subject", "timing")
+        elif issue in ("임금체불", "근로계약서 미작성", "주휴수당", "최저임금", "퇴직금",
+                       "직장 내 괴롭힘", "산재", "연장·야간·휴일수당"):
+            priority = ("purpose", "action", "subject", "timing")
+        elif issue == "부당해고":
+            priority = ("purpose", "action", "subject", "timing")
         elif issue == "신체접촉형 강제추행":
             priority = ("purpose", "evidence", "timing", "action", "subject")
         elif issue == "강간":
@@ -330,15 +354,25 @@ class ClarificationManager:
         else:
             priority = ("subject", "action", "purpose", "timing", "evidence")
 
-        for topic in priority:
-            if topic in ("evidence",):
-                if not self._has_context_signal(context, topic):
-                    if topic == last_topic:
-                        continue  # 이미 증거 질문을 했으면 반복하지 않음
-                    return topic
-                continue
+        _context_only_issues = (
+            "임금체불", "최저임금", "주휴수당", "연장·야간·휴일수당",
+            "부당해고", "근로계약서 미작성", "퇴직금", "직장 내 괴롭힘", "산재",
+            "교육기관 언어적 성희롱", "언어적 성희롱", "직장 내 성희롱",
+        )
+        use_context_only = issue in _context_only_issues
 
-            if not entity_check.get(topic, False) and not self._has_context_signal(context, topic):
+        for topic in priority:
+            if use_context_only:
+                has_topic = (
+                    self._has_context_signal(context, topic)
+                    or (topic == "purpose" and self._has_obvious_purpose(context))
+                )
+            elif topic in ("evidence",):
+                has_topic = self._has_context_signal(context, topic)
+            else:
+                has_topic = bool(entity_check.get(topic, False)) or self._has_context_signal(context, topic)
+
+            if not has_topic:
                 if topic == last_topic:
                     continue
                 return topic
