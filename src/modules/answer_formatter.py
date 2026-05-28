@@ -196,26 +196,44 @@ class AnswerFormatter:
         category = legal_category or "일반 법률"
 
         if category == "성폭력":
-            situation = self._sex_situation(question, case_frame)
-            legal_judgment = self._sex_legal_judgment(question, draft_answer, issue_plan)
-            check_items = self._sex_check_items(question, issue_plan, case_frame)
             _frame = self._as_dict(case_frame)
-            _relationship = str(_frame.get("relationship") or "")
-            _is_school = any(k in _relationship for k in ("학교", "교육", "선배", "교수", "동아리")) or \
-                         any(k in question for k in ("학교", "동아리", "선배", "교수", "캠퍼스"))
-            actions = [
-                "사건 직후 기억나는 내용을 시간순으로 메모하세요.",
-                "함께 있던 사람, 카카오톡 대화, 사과 메시지, CCTV, 장소 정보를 정리하세요.",
-            ]
-            if _is_school:
-                actions.append("학교 사건이면 학교 인권센터·성평등센터·학생상담센터에 상담 또는 신고를 요청할 수 있습니다.")
-            actions.append("긴급하거나 신변 위협이 있으면 즉시 경찰에 신고하세요.")
-            help_places = [
-                "경찰 긴급신고: 112",
-                "여성긴급전화: 1366",
-                "해바라기센터: 성폭력 피해 상담·의료·수사 연계 지원",
-                "학교 인권센터·성평등센터: 학내 상담·신고·보호조치 문의",
-            ]
+            questioner_role = str(_frame.get("questioner_role") or "피해자")
+
+            if questioner_role == "피의자":
+                situation = self._sex_situation_suspect(question, case_frame)
+                legal_judgment = self._sex_legal_judgment_suspect(question, draft_answer, issue_plan)
+                check_items = self._sex_check_items_suspect(question, case_frame)
+                actions = [
+                    "당시 상황과 경위를 기억나는 대로 시간순으로 메모하세요.",
+                    "CCTV, 목격자 등 상황을 객관적으로 확인할 수 있는 자료를 확보하세요.",
+                    "상대방으로부터 연락이 오거나 경찰 조사 통보를 받으면 혼자 대응하지 말고 변호사 상담을 먼저 받으세요.",
+                    "경찰 조사 시 진술 전 반드시 변호사 조력을 요청하세요.",
+                ]
+                help_places = [
+                    "대한법률구조공단: 132 (무료 법률상담)",
+                    "대한변호사협회 법률상담센터: 1566-0500",
+                    "경찰 민원 안내: 182",
+                ]
+            else:
+                situation = self._sex_situation(question, case_frame)
+                legal_judgment = self._sex_legal_judgment(question, draft_answer, issue_plan)
+                check_items = self._sex_check_items(question, issue_plan, case_frame)
+                _relationship = str(_frame.get("relationship") or "")
+                _is_school = any(k in _relationship for k in ("학교", "교육", "선배", "교수", "동아리")) or \
+                             any(k in question for k in ("학교", "동아리", "선배", "교수", "캠퍼스"))
+                actions = [
+                    "사건 직후 기억나는 내용을 시간순으로 메모하세요.",
+                    "함께 있던 사람, 카카오톡 대화, 사과 메시지, CCTV, 장소 정보를 정리하세요.",
+                ]
+                if _is_school:
+                    actions.append("학교 사건이면 학교 인권센터·성평등센터·학생상담센터에 상담 또는 신고를 요청할 수 있습니다.")
+                actions.append("긴급하거나 신변 위협이 있으면 즉시 경찰에 신고하세요.")
+                help_places = [
+                    "경찰 긴급신고: 112",
+                    "여성긴급전화: 1366",
+                    "해바라기센터: 성폭력 피해 상담·의료·수사 연계 지원",
+                    "학교 인권센터·성평등센터: 학내 상담·신고·보호조치 문의",
+                ]
         elif category == "노동":
             situation = self._labor_situation(question)
             legal_judgment = self._labor_legal_judgment(question, draft_answer)
@@ -318,6 +336,84 @@ class AnswerFormatter:
     # ------------------------------------------------------------------
     # 사안별 문장 생성
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_photo_upload_case(question: str) -> bool:
+        return any(k in question for k in ("사진", "영상", "동영상", "올렸", "올린", "게시", "유포", "공유", "인스타", "sns", "SNS", "카톡"))
+
+    def _sex_situation_suspect(self, question: str, case_frame: Any | None = None) -> str:
+        if self._is_photo_upload_case(question):
+            return (
+                "질문자가 상대방(여자친구 등)의 사진·영상을 동의 없이 SNS나 메신저 등에 게시·공유한 사안입니다. "
+                "상대방이 이를 음란물 유포 또는 초상권·사생활 침해로 신고하겠다고 한 상황입니다. "
+                "법적 처벌 가능성은 사진의 성적 성격, 상대방 동의 여부, 게시 경위에 따라 달라집니다."
+            )
+
+        frame = self._as_dict(case_frame)
+        body_part = frame.get("body_part") or ""
+        if not body_part:
+            for part in ("가슴", "엉덩이", "허벅지", "신체"):
+                if part in question:
+                    body_part = part
+                    break
+            else:
+                body_part = "신체"
+
+        accidental = any(k in question for k in ("실수로", "우연히", "넘어지면서", "넘어지다가", "부딪히"))
+        if accidental:
+            return (
+                f"질문자가 우연한 사고 또는 실수로 상대방의 {body_part}에 접촉한 사안입니다. "
+                "형법상 강제추행 성립 여부는 고의성과 성적 수치심 유발 가능성을 함께 판단하므로, "
+                "실수임을 뒷받침하는 경위와 객관적 증거가 중요합니다."
+            )
+        return (
+            f"질문자가 상대방의 {body_part}에 접촉한 사안으로, 고소·처벌 가능성에 대해 문의하고 있습니다. "
+            "성추행(강제추행) 성립 여부는 행위의 고의성, 상대방 의사, 당시 상황의 성적 성격 등에 따라 달라집니다."
+        )
+
+    def _sex_legal_judgment_suspect(self, question: str, draft_answer: str, issue_plan: Any | None = None) -> str:
+        if self._is_photo_upload_case(question):
+            return (
+                "동의 없이 타인의 사진·영상을 유포하면 성폭력처벌법상 촬영물 무단 반포(제14조)나 "
+                "정보통신망법상 명예훼손 쟁점이 될 수 있습니다. "
+                "수영복처럼 신체 노출이 제한적인 사진은 '음란물'보다 초상권·사생활 침해로 판단될 가능성이 높고, "
+                "처벌 여부는 사진의 성적 성격, 상대방 동의 유무, 게시 목적에 따라 달라집니다. "
+                "현 시점에서 가장 중요한 것은 즉각 게시물 삭제와 형사 전문 변호사 상담입니다."
+            )
+
+        accidental = any(k in question for k in ("실수로", "우연히", "넘어지면서", "넘어지다가", "부딪히"))
+        if accidental:
+            return (
+                "형법상 강제추행(제298조)은 고의로 성적 수치심을 유발하는 신체접촉을 요건으로 합니다. "
+                "완전히 우발적인 사고(넘어지면서의 접촉 등)는 고의성 부재를 이유로 강제추행이 성립하지 않을 수 있으나, "
+                "상대방의 진술과 당시 상황에 따라 수사기관이 다르게 판단할 수 있습니다. "
+                "고의성 여부를 객관적으로 입증할 수 있는 자료(CCTV, 목격자 진술 등)가 핵심입니다."
+            )
+        return (
+            "형법상 강제추행(제298조)은 폭행·협박을 수반하거나 상대방 의사에 반하는 신체접촉으로 "
+            "성적 수치심을 유발하는 행위를 말합니다. "
+            "고소 가능성은 행위의 고의성, 방법, 상대방 반응과 진술, 증거에 따라 달라지므로 "
+            "지금 단계에서 확정하기 어렵습니다. 형사 전문 변호사 상담을 우선하세요."
+        )
+
+    def _sex_check_items_suspect(self, question: str, case_frame: Any | None = None) -> list[tuple[str, str]]:
+        if self._is_photo_upload_case(question):
+            return [
+                ("사진·영상 게시 전 상대방 동의를 받았는지", "사전 동의 여부가 처벌 가능성을 결정하는 핵심 요소입니다."),
+                ("사진의 성적 성격 — 단순 수영복인지, 신체 노출이 과도한지", "성폭력처벌법 적용 기준인 '성적 수치심 유발 여부'를 판단합니다."),
+                ("게시물이 아직 남아 있는지, 즉시 삭제 가능한지", "즉각 삭제는 피해 최소화 의사를 보여줘 수사에 유리하게 작용할 수 있습니다."),
+                ("이미 경찰 신고나 고소가 접수됐는지", "신고 접수 여부에 따라 대응 시급성이 달라집니다."),
+            ]
+
+        items: list[tuple[str, str]] = [
+            ("접촉이 우연·사고로 발생했는지, 고의적이었는지", "강제추행 고의성 판단에 가장 중요한 요소입니다."),
+            ("당시 상황을 입증할 CCTV나 목격자가 있는지", "객관적 증거가 고의성 부재 주장을 뒷받침합니다."),
+            ("상대방이 어떤 반응을 보였는지", "피해자 진술의 방향과 행위의 성격을 판단하는 데 영향을 줍니다."),
+            ("이미 경찰 조사나 고소 통보를 받았는지", "대응 시급성과 절차가 달라집니다."),
+        ]
+        if any(k in question for k in ("술", "취해", "만취")):
+            items.insert(1, ("당시 음주 상태", "본인과 상대방의 음주 상태는 준강제추행(제299조) 쟁점에 영향을 줄 수 있습니다."))
+        return items[:4]
 
     def _sex_situation(self, question: str, case_frame: Any | None = None) -> str:
         frame = self._as_dict(case_frame)

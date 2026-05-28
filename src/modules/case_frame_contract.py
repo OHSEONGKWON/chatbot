@@ -47,6 +47,7 @@ class CaseFrame:
     body_part: str | None = None
     evidence: str | None = None
     confidence: float = 0.5
+    questioner_role: str = "피해자"  # "피해자" | "피의자" | "제3자"
 
     @property
     def has_condition_exchange(self) -> bool:
@@ -71,6 +72,7 @@ class CaseFrame:
             "body_part": self.body_part,
             "evidence": self.evidence,
             "confidence": self.confidence,
+            "questioner_role": self.questioner_role,
         }
 
 
@@ -136,6 +138,52 @@ def _contains_any(text: str, terms: tuple[str, ...] | list[str]) -> bool:
     return any(term and term in text for term in terms)
 
 
+def _detect_questioner_role(text: str) -> str:
+    """질문자가 피의자(행위자) 관점인지 피해자 관점인지 감지. 기본값 '피해자'."""
+    # 1인칭 행위자 + 성적 접촉 동사
+    first_person_contact = _contains_any(text, (
+        "내가 만졌", "내가만졌", "제가 만졌", "제가만졌",
+        "내가 건드렸", "제가 건드렸", "내가 추행", "제가 추행",
+    )) or (
+        any(p in text for p in ("내가", "제가", "나는")) and
+        _contains_any(text, SEXUAL_CONTACT_TERMS)
+    )
+    # 1인칭 행위자 + 사진·영상 게시·유포
+    first_person_upload = (
+        any(p in text for p in ("내가", "제가", "내 계정", "내 sns", "내 SNS", "내 인스타", "내 카톡", "내 폰")) and
+        _contains_any(text, ("올렸", "게시했", "유포했", "공유했", "퍼뜨렸", "보냈"))
+    ) and _contains_any(text, ("사진", "영상", "동영상", "이미지", "파일"))
+    # 상대방이 나를 신고/고소하겠다는 표현 (피의자 공통)
+    being_reported = _contains_any(text, (
+        "나를 신고", "나를 고소", "나한테 고소", "나한테 신고",
+        "저를 신고", "저를 고소",
+        "신고한대", "신고하겠다고", "신고하겠다 해", "신고할 것 같",
+        "고소한대", "고소하겠다고", "고소하겠다 해", "고소할 것 같",
+        "신고하려", "고소하려",
+    ))
+    # 피의자 특유의 두려움·확인 표현
+    accusation_fear = _contains_any(text, (
+        "고소되는거 아니지", "고소되는 거 아니지",
+        "고소당할", "신고당할", "처벌받을",
+        "성추행으로 고소", "성추행으로 신고",
+        "이거 성추행", "이거성추행",
+        "성추행 아니지", "성추행아니지",
+        "성추행이야", "성추행인가",
+        "강제추행 아니지", "강제추행아니지",
+        "처벌받는 거 아니", "처벌되는 거 아니",
+        "음란물 유포로 나", "불법촬영으로 나",
+        "이게 범죄야", "이게 처벌",
+    ))
+    # 우발적 사고 + 성적 접촉
+    accidental_contact = _contains_any(text, (
+        "실수로", "우연히", "넘어지면서", "넘어지다가", "부딪히면서",
+    )) and _contains_any(text, SEXUAL_CONTACT_TERMS)
+
+    if first_person_contact or first_person_upload or being_reported or accusation_fear or accidental_contact:
+        return "피의자"
+    return "피해자"
+
+
 def _extract_actor(text: str) -> str | None:
     for term in ("사장님", "사장", "점장", "상사", "교수님", "교수", "조교", "선배", "남편", "아내", "와이프"):
         if term in text:
@@ -144,9 +192,12 @@ def _extract_actor(text: str) -> str | None:
 
 
 def _extract_body_part(text: str) -> str | None:
-    for part in ("가슴", "엉덩이", "허벅지", "성기", "입술", "입", "허리", "어깨", "손", "팔", "다리"):
+    for part in ("가슴", "엉덩이", "허벅지", "성기", "입술", "허리", "어깨", "손", "팔", "다리"):
         if part in text:
             return part
+    # "입"은 착용 동사(입다)와 구분 — 입은/입고/입어/입었/입을/입으/입지 등은 제외
+    if "입" in text and not re.search(r"입[은고어었을으지다]", text):
+        return "입"
     return None
 
 
@@ -187,6 +238,7 @@ def extract_case_frame(question: str, context: str = "") -> CaseFrame:
     requested_act = _extract_requested_act(text)
     condition_or_exchange = _extract_condition_or_exchange(text)
     unpaid_claim = _extract_unpaid_claim(text)
+    questioner_role = _detect_questioner_role(text)
 
     relationship = None
     if _contains_any(text, WORK_RELATION_TERMS):
@@ -243,6 +295,7 @@ def extract_case_frame(question: str, context: str = "") -> CaseFrame:
         body_part=body_part,
         evidence="증거 언급" if _contains_any(text, ("카톡", "문자", "녹음", "CCTV", "목격자", "증거")) else None,
         confidence=round(confidence, 3),
+        questioner_role=questioner_role,
     )
 
 
