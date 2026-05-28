@@ -203,12 +203,20 @@ class AnswerFormatter:
                 situation = self._sex_situation_suspect(question, case_frame)
                 legal_judgment = self._sex_legal_judgment_suspect(question, draft_answer, issue_plan)
                 check_items = self._sex_check_items_suspect(question, case_frame)
-                actions = [
-                    "당시 상황과 경위를 기억나는 대로 시간순으로 메모하세요.",
-                    "CCTV, 목격자 등 상황을 객관적으로 확인할 수 있는 자료를 확보하세요.",
-                    "상대방으로부터 연락이 오거나 경찰 조사 통보를 받으면 혼자 대응하지 말고 변호사 상담을 먼저 받으세요.",
-                    "경찰 조사 시 진술 전 반드시 변호사 조력을 요청하세요.",
-                ]
+                if self._is_photo_upload_case(question):
+                    actions = [
+                        "SNS·메신저에 올린 게시물을 지금 바로 삭제하세요.",
+                        "여자친구(상대방)와 나눈 카카오톡·문자 대화를 캡처해 보관하세요 (동의 여부 확인용).",
+                        "사진을 게시하게 된 경위와 대화 내용을 시간순으로 메모하세요.",
+                        "상대방이 실제로 신고·고소한다면 즉시 변호사 상담을 받으세요.",
+                    ]
+                else:
+                    actions = [
+                        "당시 상황과 경위를 기억나는 대로 시간순으로 메모하세요.",
+                        "CCTV, 목격자 등 상황을 객관적으로 확인할 수 있는 자료를 확보하세요.",
+                        "상대방으로부터 연락이 오거나 경찰 조사 통보를 받으면 혼자 대응하지 말고 변호사 상담을 먼저 받으세요.",
+                        "경찰 조사 시 진술 전 반드시 변호사 조력을 요청하세요.",
+                    ]
                 help_places = [
                     "대한법률구조공단: 132 (무료 법률상담)",
                     "대한변호사협회 법률상담센터: 1566-0500",
@@ -344,9 +352,9 @@ class AnswerFormatter:
     def _sex_situation_suspect(self, question: str, case_frame: Any | None = None) -> str:
         if self._is_photo_upload_case(question):
             return (
-                "질문자가 상대방(여자친구 등)의 사진·영상을 동의 없이 SNS나 메신저 등에 게시·공유한 사안입니다. "
+                "질문자가 상대방(여자친구 등)의 사진·영상을 SNS나 메신저 등에 게시·공유하였고, "
                 "상대방이 이를 음란물 유포 또는 초상권·사생활 침해로 신고하겠다고 한 상황입니다. "
-                "법적 처벌 가능성은 사진의 성적 성격, 상대방 동의 여부, 게시 경위에 따라 달라집니다."
+                "사전 동의 여부와 사진의 성적 성격에 따라 법적 결론이 크게 달라집니다."
             )
 
         frame = self._as_dict(case_frame)
@@ -373,12 +381,22 @@ class AnswerFormatter:
 
     def _sex_legal_judgment_suspect(self, question: str, draft_answer: str, issue_plan: Any | None = None) -> str:
         if self._is_photo_upload_case(question):
+            is_swimsuit = any(k in question for k in ("수영복", "비키니", "수영"))
+            if is_swimsuit:
+                swimsuit_note = (
+                    "수영복 사진은 통상적인 법적 기준상 음란물에 해당하기 어렵습니다. "
+                    "음란물은 사회통념상 성욕을 자극하고 수치심을 일으키는 노골적 성적 표현을 요건으로 하는데, "
+                    "일반적인 수영복 착용 사진은 이 기준을 충족하지 않는 경우가 대부분입니다. "
+                )
+            else:
+                swimsuit_note = ""
             return (
-                "동의 없이 타인의 사진·영상을 유포하면 성폭력처벌법상 촬영물 무단 반포(제14조)나 "
-                "정보통신망법상 명예훼손 쟁점이 될 수 있습니다. "
-                "수영복처럼 신체 노출이 제한적인 사진은 '음란물'보다 초상권·사생활 침해로 판단될 가능성이 높고, "
-                "처벌 여부는 사진의 성적 성격, 상대방 동의 유무, 게시 목적에 따라 달라집니다. "
-                "현 시점에서 가장 중요한 것은 즉각 게시물 삭제와 형사 전문 변호사 상담입니다."
+                f"{swimsuit_note}"
+                "다만 상대방의 동의 없이 사진을 게시했다면 민법상 초상권·사생활 침해로 손해배상 청구 대상이 될 수 있고, "
+                "사진의 성적 성격이 강하거나 상대방이 성적 수치심을 느낀다고 주장하면 "
+                "정보통신망법상 사생활 침해(제44조의7) 쟁점이 될 수 있습니다. "
+                "처벌 가능성은 동의 여부, 사진 내용, 게시 목적에 따라 달라지므로 "
+                "즉시 게시물을 삭제하고 변호사 상담을 받는 것이 우선입니다."
             )
 
         accidental = any(k in question for k in ("실수로", "우연히", "넘어지면서", "넘어지다가", "부딪히"))
