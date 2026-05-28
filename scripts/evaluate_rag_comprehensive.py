@@ -321,11 +321,13 @@ class DenseRetriever:
     }
 
     def __init__(self, model_type: str = "e5"):
+        import torch
         assert model_type in ("e5", "bgem3"), f"지원하지 않는 모델: {model_type}"
         self._model_type = model_type
         self._docs: list[dict[str, Any]] = []
         self._embeddings = None
         self._model = None
+        self._device = "cuda" if torch.cuda.is_available() else "cpu"
 
     def _cache_path(self, jsonl_paths: list[Path]) -> Path:
         """JSONL 파일 목록과 모델 타입으로 캐시 파일 경로 결정."""
@@ -353,9 +355,9 @@ class DenseRetriever:
             print(f"  [Dense/{label}] 캐시 로드: {cache_path.name}")
             saved = torch.load(cache_path, map_location="cpu", weights_only=False)
             self._docs = saved["docs"]
-            self._embeddings = saved["embeddings"]
-            print(f"  [Dense/{label}] 캐시에서 {len(self._docs):,}개 문서 / 임베딩 {self._embeddings.shape} 복원")
-            # 모델은 retrieve 시 사용하지 않으므로 불필요 (점수 계산만 텐서 연산)
+            self._embeddings = saved["embeddings"].to(self._device)
+            print(f"  [Dense/{label}] 캐시에서 {len(self._docs):,}개 문서 / 임베딩 {self._embeddings.shape} ({self._device}) 복원")
+            # 모델은 retrieve() 호출 시 지연 로드 (_load_model_if_needed)
             return
 
         # ── 문서 로딩 ─────────────────────────────────────────────────────────
@@ -374,26 +376,37 @@ class DenseRetriever:
         print(f"  [Dense/{label}] 총 {len(self._docs):,}개 문서 로드 완료")
 
         # ── 임베딩 생성 ───────────────────────────────────────────────────────
-        print(f"  [Dense/{label}] 모델 로딩 및 임베딩 생성 중 (시간이 걸립니다)...")
+        print(f"  [Dense/{label}] 모델 로딩 및 임베딩 생성 중...")
         try:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            if device == "cuda":
+            if self._device == "cuda":
                 print(f"  [Dense/{label}] GPU: {torch.cuda.get_device_name(0)}")
             else:
                 print(f"  [Dense/{label}] CPU 모드 (CUDA 없음) — 느릴 수 있음")
             model_id = self._MODEL_IDS[self._model_type]
             try:
-                self._model = SentenceTransformer(model_id, device=device, local_files_only=True)
+                self._model = SentenceTransformer(model_id, device=self._device, local_files_only=True)
             except Exception:
                 print(f"  [Dense/{label}] 로컬 캐시 없음 → HuggingFace에서 다운로드 중...")
-                self._model = SentenceTransformer(model_id, device=device)
+                self._model = SentenceTransformer(model_id, device=self._device)
+
+            # GPU: fp16으로 변환해 메모리 절반 + 처리 속도 2배
+            if self._device == "cuda":
+                self._model = self._model.half()
+
             prefix = self._PASSAGE_PREFIX[self._model_type]
-            texts = [f"{prefix}{d['text'][:512]}" for d in self._docs]
+            # 텍스트 길이를 400자로 제한:
+            # 한국어 1자 ≈ 1.5토큰 → 400자 ≈ 600토큰 → 토크나이저가 512토큰으로 최종 truncate
+            # 모델이 실제로 처리할 수 있는 최대 한도(~340자)를 커버하면서,
+            # 매우 긴 문서(최대 14,074자)로 인한 불필요한 패딩은 차단
+            texts = [f"{prefix}{d['text'][:400]}" for d in self._docs]
+            # GPU: batch_size=256, CPU: batch_size=32
+            batch_size = 256 if self._device == "cuda" else 32
+            print(f"  [Dense/{label}] 총 {len(texts):,}개 / batch_size={batch_size} / fp16={'on' if self._device == 'cuda' else 'off'}")
             self._embeddings = self._model.encode(
-                texts, batch_size=32, show_progress_bar=True,
+                texts, batch_size=batch_size, show_progress_bar=True,
                 normalize_embeddings=True, convert_to_tensor=True,
             )
-            print(f"  [Dense/{label}] 임베딩 완료: {self._embeddings.shape}")
+            print(f"  [Dense/{label}] 임베딩 완료: {self._embeddings.shape} ({self._device})")
 
             # ── 캐시 저장 ─────────────────────────────────────────────────────
             cache_path.parent.mkdir(exist_ok=True)
@@ -402,6 +415,19 @@ class DenseRetriever:
         except Exception as e:
             print(f"  [Dense/{label}] 모델 로드 실패: {e}")
             self._embeddings = None
+
+    def _load_model_if_needed(self) -> None:
+        """캐시 로드 후 쿼리 인코딩 시 모델이 없으면 지연 로드."""
+        if self._model is not None:
+            return
+        from sentence_transformers import SentenceTransformer
+        model_id = self._MODEL_IDS[self._model_type]
+        print(f"  [Dense/{model_id}] 쿼리 인코딩용 모델 지연 로드 중...")
+        try:
+            self._model = SentenceTransformer(model_id, device=self._device, local_files_only=True)
+        except Exception:
+            self._model = SentenceTransformer(model_id, device=self._device)
+        print(f"  [Dense/{model_id}] 모델 로드 완료")
 
     @staticmethod
     def _doc_matches_category(doc: dict[str, Any], category: str) -> bool:
@@ -417,8 +443,41 @@ class DenseRetriever:
             return any(k in title for k in ["성희롱", "성폭력", "강제추행", "강간"])
         return True
 
+    @staticmethod
+    def _metadata_score(doc: dict[str, Any], category: str) -> float:
+        """BM25의 metadata_boost + source_boost를 Dense 점수 범위(0~1)에 맞게 정규화.
+
+        BM25 전형 점수 범위: 8~15, Dense 코사인 유사도 범위: 0.7~0.95
+        스케일 비율 ≈ 0.85 / 12 ≈ 0.07 적용:
+          category_boost  +3.0 → +0.20
+          statute_boost   +1.5 → +0.10
+          manual_boost    +1.0 → +0.07
+          case_boost      +0.5 → +0.03
+        """
+        meta = doc.get("metadata") or {}
+        title = " ".join(
+            str(meta.get(key) or "")
+            for key in ["law_name", "source_file", "article_title", "section_label"]
+        )
+
+        # 카테고리 부스트 (BM25 +3.0 → +0.20)
+        category_score = 0.0
+        if category == "노동" and any(k in title for k in ["근로기준법", "노동", "고용"]):
+            category_score = 0.20
+        elif category == "성폭력" and any(k in title for k in ["성희롱", "성폭력", "강제추행", "강간"]):
+            category_score = 0.20
+
+        # 소스 타입 부스트 (statute +1.5 → +0.10, manual +1.0 → +0.07, case +0.5 → +0.03)
+        source_type = str(meta.get("source_type") or "")
+        source_score = {"statute": 0.10, "manual": 0.07, "case": 0.03}.get(source_type, 0.0)
+
+        return category_score + source_score
+
     def retrieve(self, query: str, top_k: int = 5, category: str | None = None) -> list[dict[str, Any]]:
-        if self._embeddings is None or self._model is None:
+        if self._embeddings is None:
+            return []
+        self._load_model_if_needed()
+        if self._model is None:
             return []
         import torch
 
@@ -436,10 +495,16 @@ class DenseRetriever:
         prefix = self._QUERY_PREFIX[self._model_type]
         q_emb = self._model.encode(
             f"{prefix}{query}", normalize_embeddings=True, convert_to_tensor=True
-        )
-        filtered_emb = self._embeddings[doc_indices]
-        scores = torch.matmul(filtered_emb, q_emb).cpu().tolist()
-        ranked = sorted(zip(doc_indices, scores), key=lambda x: x[1], reverse=True)[:top_k]
+        ).to(self._device)
+        filtered_emb = self._embeddings[doc_indices].to(self._device)
+        cosine_scores = torch.matmul(filtered_emb, q_emb).cpu().tolist()
+
+        # BM25와 동일한 메타데이터 부스팅을 Dense 점수 범위로 정규화해 적용
+        final_scores = [
+            cos + self._metadata_score(self._docs[idx], category or "")
+            for idx, cos in zip(doc_indices, cosine_scores)
+        ]
+        ranked = sorted(zip(doc_indices, final_scores), key=lambda x: x[1], reverse=True)[:top_k]
         results = []
         for idx, score in ranked:
             doc = self._docs[idx].copy()
@@ -461,14 +526,25 @@ def _summary_to_paper_format(summary: dict, label: str) -> dict:
 
 
 def _eval_dense(label: str, dense: DenseRetriever, items: list[dict[str, Any]], top_k: int) -> dict | None:
-    """DenseRetriever 인스턴스로 items를 평가해 paper-format 결과를 반환."""
+    """DenseRetriever 인스턴스로 items를 평가해 paper-format 결과를 반환.
+
+    BM25와 동일한 조건:
+      - _expand_query_tokens()로 카테고리·쟁점 키워드 확장
+      - 카테고리 기반 문서 필터링
+    """
     if dense._embeddings is None:
         print(f"  [SKIP] {label} 임베딩 없음 — 건너뜁니다.")
         return None
     results = []
     mismatch = 0
     for item in items:
-        docs = dense.retrieve(item["query"], top_k=top_k, category=item.get("category"))
+        category = item.get("category", "")
+        # BM25와 동일한 쿼리 확장 적용
+        issues = retriever.infer_issues(item["query"], category=category)
+        expanded_tokens = retriever._expand_query_tokens(item["query"], category, issues=issues)
+        expanded_query = " ".join(expanded_tokens) if expanded_tokens else item["query"]
+
+        docs = dense.retrieve(expanded_query, top_k=top_k, category=category)
         ret_ids = [_normalize_id(str(d.get("chunk_id", ""))) for d in docs]
         golden  = {_normalize_id(k): v for k, v in item["golden_doc_ids"].items()}
         golden_set = set(golden.keys())
