@@ -169,6 +169,10 @@ async def run_webtoon_only_and_callback(user_id: str, callback_url: str):
 async def kakao_webhook(request: Request, background_tasks: BackgroundTasks):
     try:
         body = await request.json()
+        
+        # 🟢 [추가된 디버깅 코드] 카카오에서 넘어온 JSON 데이터를 통째로 출력합니다.
+        logger.info(f"카카오 원본 데이터: {body}")
+        
     except Exception:
         return JSONResponse(content=build_simple_text("요청 형식이 올바르지 않습니다."), status_code=400)
 
