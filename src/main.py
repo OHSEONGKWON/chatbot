@@ -1,4 +1,4 @@
-"""LawsGuard FastAPI 메인 애플리케이션 (디버깅 전면 강화 버전)"""
+"""LawsGuard FastAPI 메인 애플리케이션 (웹툰 선출력 수정 버전)"""
 
 import asyncio
 import logging
@@ -76,8 +76,27 @@ async def send_callback(
     quick_replies = default_quick_replies(needs_requery, category)
     
     if image_url:
-        print(f"[CALLBACK_SEND] 이미지 포함 응답 페이로드 구성 완료 -> URL: {image_url}", flush=True)
-        payload = build_text_and_image_response(response_text, image_url, quick_replies=quick_replies)
+        print("[CALLBACK_SEND] 🚀 순서 조정: [1컷] 웹툰 이미지 선출력 -> [2컷] 법률 텍스트 후출력 구성", flush=True)
+        # 카카오 표준 규격에 맞춰 outputs 배열 내부의 순서를 [이미지, 텍스트] 순서로 직접 정의합니다.
+        payload = {
+            "version": "2.0",
+            "template": {
+                "outputs": [
+                    {
+                        "simpleImage": {
+                            "imageUrl": image_url,
+                            "altText": "법률 요약 4컷 웹툰"
+                        }
+                    },
+                    {
+                        "simpleText": {
+                            "text": response_text
+                        }
+                    }
+                ],
+                "quickReplies": quick_replies
+            }
+        }
     else:
         print("[CALLBACK_SEND] ⚠️ 이미지 없음 - 일반 텍스트 단독 페이로드 구성", flush=True)
         payload = build_simple_text(response_text, quick_replies=quick_replies)
@@ -124,7 +143,7 @@ async def run_pipeline_and_callback(user_id: str, user_input: str, callback_url:
             print("[TASK_STEP2] ⚠️ 추가 질문 재확인이 필요하여 웹툰 이미지 생성을 스킵합니다.", flush=True)
                 
         # Step 3. 텍스트와 이미지(있을 경우)를 한 번에 콜백으로 전송
-        print("[TASK_STEP3] 최종 취합 데이터를 카카오 콜백 URL로 쏘기 시작합니다.", flush=True)
+        print("[TASK_STEP3] 최종 결과를 카카오 콜백 URL로 쏘기 시작합니다.", flush=True)
         await send_callback(
             callback_url=callback_url,
             response_text=result.response_text,
