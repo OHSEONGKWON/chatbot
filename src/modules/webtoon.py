@@ -1,4 +1,4 @@
-"""4컷 웹툰 이미지 생성 모듈."""
+"""4컷 웹툰 이미지 생성 모듈 (오리지널 모델 설정 유지 + 디버깅 강화)"""
 
 from __future__ import annotations
 
@@ -6,12 +6,15 @@ import base64
 import logging
 import os
 import re  # 정규표현식 모듈 추가
+import traceback
+import datetime
 from pathlib import Path
 
 import httpx
 
 from ..config import config
 
+print("[LAWSGUARD_DEBUG] >>> src/modules/webtoon.py 파일이 성공적으로 로드되었습니다! <<<", flush=True)
 
 logger = logging.getLogger("lawsguard.webtoon")
 
@@ -42,7 +45,6 @@ def _sanitize(text: str) -> str:
 def _extract_specific_points(text: str) -> dict[int, str]:
     """답변 텍스트에서 숫자 리스트(1., 2) 등)로 시작하는 줄을 찾아 딕셔너리로 반환합니다."""
     points = {}
-    # 매칭 패턴: 공백(선택) + 숫자 + 괄호나 점 + 내용 (예: " 1. 내용증명", "2) 고소장")
     pattern = re.compile(r'^\s*\[?(\d+)[\]\.\)]\s*(.*)')
     
     for line in text.split('\n'):
@@ -57,7 +59,6 @@ def _extract_specific_points(text: str) -> dict[int, str]:
 def _build_image_prompt(answer_text: str) -> str:
     safe_text = _sanitize(answer_text)
     
-    # AI 답변에서 1, 2, 4, 5번 추출 (만약 해당 번호가 없을 경우를 대비해 기본값 설정)
     points = _extract_specific_points(safe_text)
     p1 = points.get(1, "상황 발생 및 기초 사실관계 확인")
     p2 = points.get(2, "관련 증거 수집 및 법적 검토")
@@ -66,7 +67,6 @@ def _build_image_prompt(answer_text: str) -> str:
     
     character = "20대 한국인 주인공, 단정한 캐주얼 복장, 4컷 동일한 외모 유지"
     
-    # 추출한 답변 내용을 각 패널에 직접 주입합니다.
     combined = (
         f"[패널 1] 묘사 내용: {p1} |  하단 박스: \"답변 1번 내용\"\n"
         f"[패널 2] 묘사 내용: {p2} |  하단 박스: \"답변 2번 내용\"\n"
@@ -92,18 +92,22 @@ def _build_image_prompt(answer_text: str) -> str:
 
 async def generate_webtoon(answer_text: str) -> str | None:
     """법률 상담 내용으로 4컷 웹툰을 생성하고 저장된 파일명을 반환합니다. 실패 시 None."""
+    print(f"\n[WEBTOON_MODULE] generate_webtoon 함수 가동! (텍스트 길이: {len(answer_text)})", flush=True)
     from openai import AsyncOpenAI
 
     api_key = config.llm.api_key
     if not api_key:
-        logger.warning("OPENAI_API_KEY 없음 — 웹툰 생성 건너뜀")
+        print("[WEBTOON_MODULE] ❌ 오류: config.llm.api_key 주입 실패 (빈 값)", flush=True)
         return None
 
+    print("[WEBTOON_MODULE] OpenAI 비동기 클라이언트 인스턴스 생성 완료", flush=True)
     client = AsyncOpenAI(api_key=api_key)
 
     try:
         image_prompt = _build_image_prompt(answer_text)
-        # 요청하신 대로 모델명(gpt-image-2) 등 기존 설정은 그대로 유지했습니다.
+        print("[WEBTOON_MODULE] 프롬프트 빌드 완료. 오리지널 모델 커스텀 엔드포인트 호출 시작...", flush=True)
+        
+        # [기존 설정 전면 유지] 요청하신 대로 gpt-image-2 및 output_format 스펙 유지
         img_resp = await client.images.generate(
             model="gpt-image-2",
             prompt=image_prompt,
@@ -112,22 +116,34 @@ async def generate_webtoon(answer_text: str) -> str | None:
             output_format="jpeg",
             n=1,
         )
+        print("[WEBTOON_MODULE] 이미지 생성 응답 수신 완료", flush=True)
         
         img = img_resp.data[0]
         if getattr(img, "b64_json", None):
+            print("[WEBTOON_MODULE] b64_json 스트림 디코딩 가동", flush=True)
             image_bytes = base64.b64decode(img.b64_json)
         elif getattr(img, "url", None):
+            print(f"[WEBTOON_MODULE] 이미지 URL 감지 -> {img.url} 다운로드 시작", flush=True)
             async with httpx.AsyncClient(timeout=30) as http:
                 r = await http.get(img.url)
                 image_bytes = r.content
         else:
-            raise RuntimeError("이미지 응답에 url 또는 b64_json이 없습니다.")
+            raise RuntimeError("이미지 응답 규격체에 url 및 b64_json 속성이 누락되었습니다.")
+            
     except Exception as e:
-        logger.error(f"이미지 생성 실패: {e}")
+        print(f"[WEBTOON_MODULE] ❌ 이미지 생성 내부 단계 실패 사유: {e}", flush=True)
+        # 터미널에 에러가 발생한 위치와 상세 콜스택 추적을 강제로 뿌려줍니다.
+        traceback.print_exc()
         return None
 
     import datetime
     filename = f"4cut_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.jpeg"
-    (OUTPUT_DIR / filename).write_bytes(image_bytes)
-    logger.info(f"웹툰 저장 완료: {filename}")
-    return filename
+    try:
+        target_path = OUTPUT_DIR / filename
+        target_path.write_bytes(image_bytes)
+        print(f"[WEBTOON_MODULE] ✅ 오리지널 파일 저장 완료: {target_path}", flush=True)
+        return filename
+    except Exception as save_err:
+        print(f"[WEBTOON_MODULE] ❌ 디스크 저장(Write) 실패: {save_err}", flush=True)
+        traceback.print_exc()
+        return None
