@@ -300,7 +300,7 @@ class ClarificationManager:
             # 도메인 분류어(성희롱·강간·임금 등)가 아닌 실제 행위 서술어만 신호로 사용한다.
             # 도메인어는 _has_strong_issue_signal 에서 따로 처리한다.
             return _contains_any(ctx, (
-                "추행", "발언", "말했", "만졌",                                        # 신체·언어 행위
+                "추행", "말했", "만졌",                                               # 신체·언어 행위 ("발언" 제외: 내용 없는 메타 단어)
                 "해고", "그만 나오", "나오지 말",                                       # 고용 종료 행위
                 "못 받", "미지급", "못 줬", "안 줬", "안 줘", "안 주", "주지 않", "지급 안",   # 임금 미지급 (수급자·지급자 양방향)
                 "일했", "근무", "근로계약서",                                           # 근로 사실
@@ -336,19 +336,20 @@ class ClarificationManager:
         context: str,
         last_missing: list[str] | None = None,
         last_topic: str = "",
+        asked_topics: list[str] | None = None,
     ) -> str:
         entity_check = _normalize_entity_check(eval_result.entity_check)
         issue = self._infer_issue(context, eval_result.legal_category)
 
         if issue in ("교육기관 언어적 성희롱", "언어적 성희롱"):
-            priority = ("purpose", "evidence", "action", "subject")
+            priority = ("purpose", "action", "subject", "evidence")
         elif issue in ("임금체불", "근로계약서 미작성", "주휴수당", "최저임금", "퇴직금",
                        "직장 내 괴롭힘", "산재", "연장·야간·휴일수당"):
             priority = ("purpose", "action", "subject", "timing")
         elif issue == "부당해고":
             priority = ("purpose", "action", "subject", "timing")
         elif issue == "신체접촉형 강제추행":
-            priority = ("purpose", "evidence", "timing", "action", "subject")
+            priority = ("action", "purpose", "evidence", "timing", "subject")
         elif issue == "강간":
             priority = ("subject", "evidence", "timing", "purpose")
         else:
@@ -359,10 +360,18 @@ class ClarificationManager:
             "부당해고", "근로계약서 미작성", "퇴직금", "직장 내 괴롭힘", "산재",
             "교육기관 언어적 성희롱", "언어적 성희롱", "직장 내 성희롱",
         )
-        use_context_only = issue in _context_only_issues
+        use_context_only = issue in _context_only_issues or eval_result.legal_category == "불명확"
+
+        _SPECIFIC_BODY_PARTS = (
+            "가슴", "엉덩이", "허벅지", "음부", "젖가슴",
+            "가슴을 만", "엉덩이를 만", "허벅지를 만", "음부를 만", "사타구니",
+        )
 
         for topic in priority:
-            if use_context_only:
+            # 신체접촉형 강제추행의 action은 구체적 신체 부위가 있어야 충족으로 간주
+            if issue == "신체접촉형 강제추행" and topic == "action":
+                has_topic = _contains_any(context or "", _SPECIFIC_BODY_PARTS)
+            elif use_context_only:
                 has_topic = (
                     self._has_context_signal(context, topic)
                     or (topic == "purpose" and self._has_obvious_purpose(context))
@@ -373,7 +382,7 @@ class ClarificationManager:
                 has_topic = bool(entity_check.get(topic, False)) or self._has_context_signal(context, topic)
 
             if not has_topic:
-                if topic == last_topic:
+                if topic in (asked_topics or []):
                     continue
                 return topic
 
@@ -663,8 +672,9 @@ class ClarificationManager:
 
         last_missing = list(getattr(session, "last_missing_elements", []) or []) if session else []
         last_topic = getattr(session, "last_requery_topic", "") if session else ""
+        asked_topics = list(getattr(session, "asked_topics", []) or []) if session else []
 
-        topic = self._pick_next_topic(eval_stub, context, last_missing, last_topic=last_topic)
+        topic = self._pick_next_topic(eval_stub, context, last_missing, last_topic=last_topic, asked_topics=asked_topics)
 
         message, example = self._legal_topic_to_message(
             legal_category=legal_category,
@@ -683,6 +693,8 @@ class ClarificationManager:
             session.last_requery_topic = topic
             session.last_requery_message = result
             session.last_missing_elements = normalized_missing
+            if topic not in session.asked_topics:
+                session.asked_topics.append(topic)
 
         return result
 

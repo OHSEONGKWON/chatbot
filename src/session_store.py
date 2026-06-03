@@ -35,6 +35,7 @@ class ClarificationSession:
     last_requery_message: str = ""
     last_missing_elements: list[str] = field(default_factory=list)
     last_requery_topic: str = ""
+    asked_topics: list[str] = field(default_factory=list)
 
 
 def _session_to_dict(s: ClarificationSession) -> dict:

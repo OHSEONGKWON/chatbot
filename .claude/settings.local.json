@@ -28,7 +28,8 @@
       "Bash(python tests/manual_pipeline_test.py)",
       "Bash(python -c \"from src.config import config; print\\('API key set:', bool\\(config.llm.api_key\\)\\); print\\('model:', config.llm.model_name\\)\")",
       "Bash(python scripts/finetune_and_eval_ner.py --skip-train)",
-      "Bash(python scripts/make_architecture.py)"
+      "Bash(python scripts/make_architecture.py)",
+      "PowerShell(Get-ChildItem -Path \"C:\\\\Users\\\\CHOLONG\\\\Documents\\\\GitHub\\\\chatbot\" -Recurse -Directory | Select-Object -First 30 | % { $_.FullName })"
     ]
   }
 }
