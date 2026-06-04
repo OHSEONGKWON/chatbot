@@ -77,7 +77,6 @@ async def send_callback(
     
     if image_url:
         print("[CALLBACK_SEND] 🚀 순서 조정: [1컷] 웹툰 이미지 선출력 -> [2컷] 법률 텍스트 후출력 구성", flush=True)
-        # 카카오 표준 규격에 맞춰 outputs 배열 내부의 순서를 [이미지, 텍스트] 순서로 직접 정의합니다.
         payload = {
             "version": "2.0",
             "template": {
@@ -113,13 +112,11 @@ async def send_callback(
             traceback.print_exc()
             return False
 
-# 1. 텍스트 답변 + 웹툰 동시 생성 백그라운드 파이프라인
 async def run_pipeline_and_callback(user_id: str, user_input: str, callback_url: str):
     start_time = time.monotonic()
     print(f"\n[TASK_START] 비동기 백그라운드 태스크 가동 시작 (User ID: {user_id[:8]})", flush=True)
     
     try:
-        # Step 1. RAG 텍스트 답변 생성
         print("[TASK_STEP1] RAG 파이프라인 텍스트 연산 요청...", flush=True)
         result = await pipeline.process(user_id=user_id, user_input=user_input)
         print(f"[TASK_STEP1] ✅ 텍스트 연산 완료 (구간 소요시간: {time.monotonic() - start_time:.2f}s)", flush=True)
@@ -127,7 +124,6 @@ async def run_pipeline_and_callback(user_id: str, user_input: str, callback_url:
         can_make_webtoon = not result.needs_requery
         image_url = None
         
-        # Step 2. 질문 재확인이 필요 없다면 이어서 바로 웹툰 생성
         if can_make_webtoon:
             print("[TASK_STEP2] 웹툰 생성 조건 충족 (needs_requery가 False). generate_webtoon 진입합니다.", flush=True)
             story_context = f"상황: {user_input}\n법률해석: {result.response_text}"
@@ -142,7 +138,6 @@ async def run_pipeline_and_callback(user_id: str, user_input: str, callback_url:
         else:
             print("[TASK_STEP2] ⚠️ 추가 질문 재확인이 필요하여 웹툰 이미지 생성을 스킵합니다.", flush=True)
                 
-        # Step 3. 텍스트와 이미지(있을 경우)를 한 번에 콜백으로 전송
         print("[TASK_STEP3] 최종 결과를 카카오 콜백 URL로 쏘기 시작합니다.", flush=True)
         await send_callback(
             callback_url=callback_url,
@@ -179,7 +174,6 @@ async def kakao_webhook(request: Request, background_tasks: BackgroundTasks):
     if not user_input:
         return JSONResponse(content=build_simple_text("질문을 입력해 주세요.", quick_replies=default_quick_replies(True)))
 
-    # 분기 필터링 검증
     if config.kakao.use_callback and callback_url:
         print("[WEBHOOK_ROUTE] ✅ 조건 만족: 비동기(Callback) 백그라운드 태스크 예약 완료!", flush=True)
         background_tasks.add_task(

@@ -31,7 +31,6 @@ class ClarificationSession:
     use_general_answer: bool = False
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
-    # remember last requery to prevent repeating identical follow-ups
     last_requery_message: str = ""
     last_missing_elements: list[str] = field(default_factory=list)
     last_requery_topic: str = ""

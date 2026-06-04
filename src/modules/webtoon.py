@@ -5,7 +5,7 @@ from __future__ import annotations
 import base64
 import logging
 import os
-import re  # 정규표현식 모듈 추가
+import re
 import traceback
 import datetime
 from pathlib import Path
@@ -107,7 +107,6 @@ async def generate_webtoon(answer_text: str) -> str | None:
         image_prompt = _build_image_prompt(answer_text)
         print("[WEBTOON_MODULE] 프롬프트 빌드 완료. 오리지널 모델 커스텀 엔드포인트 호출 시작...", flush=True)
         
-        # [기존 설정 전면 유지] 요청하신 대로 gpt-image-2 및 output_format 스펙 유지
         img_resp = await client.images.generate(
             model="gpt-image-2",
             prompt=image_prompt,
@@ -132,7 +131,6 @@ async def generate_webtoon(answer_text: str) -> str | None:
             
     except Exception as e:
         print(f"[WEBTOON_MODULE] ❌ 이미지 생성 내부 단계 실패 사유: {e}", flush=True)
-        # 터미널에 에러가 발생한 위치와 상세 콜스택 추적을 강제로 뿌려줍니다.
         traceback.print_exc()
         return None
 

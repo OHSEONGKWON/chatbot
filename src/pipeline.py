@@ -91,7 +91,6 @@ class LawsGuardPipeline:
         labor_terms = ("임금", "알바비", "주휴수당", "최저임금", "월급", "급여", "시급", "근무시간", "해고", "사장", "점장", "상사", "알바", "회사", "직장")
         explicit_labor = unpaid_claim or any(t in text for t in labor_terms) or any(t in condition_or_exchange for t in labor_terms)
 
-        # IssuePlan이 명시적으로 배제한 쟁점은 최종 분류에서 중심 분류로 쓰지 않는다.
         if domain == "성폭력" or "강제추행" in primary or "성희롱" in primary:
             if explicit_labor and "임금체불" not in excluded:
                 return "성폭력/노동"
@@ -107,9 +106,6 @@ class LawsGuardPipeline:
         if session is None:
             session = session_store.create(user_id, user_input)
 
-        # process() 호출 전에 이전 재질문 메시지를 캡처해야 한다.
-        # process() 내부에서 session.last_requery_message가 갱신되므로,
-        # 호출 후에 읽으면 항상 현재 재질문과 동일해서 repeated_requery=True로 오판된다.
         previous_requery = getattr(session, "last_requery_message", "")
 
         clarify_result: ClarificationResult = await self._clarify.process(session=session, user_input=user_input)
@@ -126,7 +122,6 @@ class LawsGuardPipeline:
 
         if clarify_result.needs_requery and not force_answer and not can_answer_by_frame:
             repeated_requery = bool(previous_requery and previous_requery.strip() == (clarify_result.requery_message or "").strip())
-            # 반복 재질문이면 더 묻지 않고 조건부 답변으로 전환한다.
             if not repeated_requery:
                 quality_report = self._build_quality_report(extra={
                     "CaseFrame": case_frame.to_dict(),
@@ -147,7 +142,6 @@ class LawsGuardPipeline:
             general_prefix = self._cfg.clarification.fallback_message + "\n\n"
 
         final_question = clarify_result.final_question or context_text
-        # CaseFrame/IssuePlan이 잡은 핵심 법령·초점을 검색어에 반영
         search_query = " ".join([
             final_question,
             str(issue_plan.primary_issue or ""),
@@ -195,8 +189,6 @@ class LawsGuardPipeline:
 
         if answer_reliability < self._cfg.hallucination.consistency_threshold:
             if not (rrs_report.get("score", 0.0) >= 0.72 and issue_plan.confidence >= 0.70):
-                # 일관성 낮음: 환각 위험이 있으므로 LLM 생성 답변 대신 안전 템플릿 답변으로 대체.
-                # 거절(requery) 대신 계속 진행해 사용자가 항상 어떤 답변이든 받도록 한다.
                 original_answer = build_safe_contract_answer(case_frame, issue_plan)
 
         initial_contract_check = check_answer_contract(original_answer, case_frame, issue_plan, answer_contract)
@@ -232,8 +224,6 @@ class LawsGuardPipeline:
             guarded_answer = build_safe_contract_answer(case_frame, issue_plan)
             final_contract_check = check_answer_contract(guarded_answer, case_frame, issue_plan, answer_contract)
 
-        # QAFS가 낮으면 최종 답변을 그대로 출력하지 않고 CaseFrame/IssuePlan 기반 안전 답변으로 재작성한다.
-        # RRS가 낮은 경우 formatter가 참고 근거를 보수적으로 정리하도록 rrs_report를 함께 넘긴다.
         if final_contract_check.score < 0.65:
             guarded_answer = build_safe_contract_answer(case_frame, issue_plan)
             final_contract_check = check_answer_contract(guarded_answer, case_frame, issue_plan, answer_contract)

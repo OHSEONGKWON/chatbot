@@ -43,7 +43,6 @@ chatbot/
 │     ├─ ner_checker.py               # NER 기반 법률 개체 환각 탐지
 │     └─ rag.py                       # JSONL/BM25 및 선택적 ChromaDB 검색
 ├─ tests/                             # 자동 테스트 및 수동 테스트 스크립트
-├─ scripts/                           # 평가, 학습, 점검용 스크립트
 ├─ data/                              # RAG 및 학습/평가 데이터
 ├─ outputs/                           # 학습된 NER 모델
 ├─ requirements.txt
