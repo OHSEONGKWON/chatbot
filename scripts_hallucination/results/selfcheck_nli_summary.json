@@ -1,0 +1,16 @@
+{
+  "method": "SelfCheckGPT-NLI",
+  "threshold": 0.15,
+  "samples": 5,
+  "total_cases": 800,
+  "metrics": {
+    "precision": 0.517,
+    "recall": 0.910,
+    "f1": 0.659,
+    "tp": 364,
+    "fp": 340,
+    "fn": 36,
+    "tn": 60
+  },
+  "note": "중간 결과 기반 (800/800 완료)"
+}
