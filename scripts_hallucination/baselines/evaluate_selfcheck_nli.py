@@ -1,4 +1,4 @@
-"""우리 모델: BERTScore (일관성) + NER + NLI"""
+"""SelfCheckGPT-NLI (논문 Section 5.4)"""
 import asyncio
 import json
 import sys
@@ -8,29 +8,53 @@ import torch
 import numpy as np
 from tqdm import tqdm
 
-sys.path.append(str(Path(__file__).resolve().parents[1]))
+sys.path.append(str(Path(__file__).resolve().parents[2]))
 
-from src.modules.ner_checker import NERFactChecker
-from src.modules.rag import retriever
 from src.modules.llm_client import llm_client
-from src.modules.embedder import get_embedder
-from load_dataset import load_dataset
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+from alcv.dataset import load_dataset
 
 # ==================== 설정 ====================
-BERTSCORE_THRESHOLD = 0.05  # 공격적 설정 (Recall 최대화)
+NLI_MODEL_NAME = "Huffon/klue-roberta-base-nli"
+THRESHOLD = 0.15  # 공격적 설정 (Recall 최대화)
 N_SAMPLES = 5
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = "cpu"  # NLI는 CPU 사용 (GPU 인덱스 오류 회피)
+
+# NLI 모델 전역
+_NLI_MODEL = None
+_NLI_TOKENIZER = None
+
+
+def load_nli_model():
+    """NLI 모델 로딩"""
+    global _NLI_MODEL, _NLI_TOKENIZER
+
+    if _NLI_MODEL is None:
+        try:
+            from transformers import AutoTokenizer, AutoModelForSequenceClassification
+
+            print(f"[NLI 모델 로딩] {NLI_MODEL_NAME}")
+            _NLI_TOKENIZER = AutoTokenizer.from_pretrained(NLI_MODEL_NAME)
+            _NLI_MODEL = AutoModelForSequenceClassification.from_pretrained(NLI_MODEL_NAME)
+            _NLI_MODEL.to(DEVICE)
+            _NLI_MODEL.eval()
+            print(f"[완료] Device: {DEVICE}\n")
+        except Exception as e:
+            print(f"[ERROR] NLI 모델 로딩 실패: {e}")
+            return None, None
+
+    return _NLI_MODEL, _NLI_TOKENIZER
 
 
 def split_sentences(text: str) -> list[str]:
-    """텍스트를 문장으로 분해"""
+    """문장 분해"""
     sentences = re.split(r'[.!?]\s+', text)
     sentences = [s.strip() for s in sentences if s.strip() and len(s) > 10]
     return sentences
 
 
 async def generate_samples(question: str, n_samples: int = N_SAMPLES) -> list[str]:
-    """샘플 답변 생성"""
+    """샘플 생성"""
     samples = []
     for i in range(n_samples):
         try:
@@ -46,10 +70,10 @@ async def generate_samples(question: str, n_samples: int = N_SAMPLES) -> list[st
     return samples
 
 
-async def selfcheck_bertscore(question: str, answer: str) -> tuple[bool, float]:
+async def selfcheck_nli_score(question: str, answer: str) -> tuple[bool, float]:
     """
-    SelfCheckGPT-BERTScore (논문 Section 5.1)
-    S_BERT(i) = 1 - (1/N) * Σ max_k (B(r_i, s_n^k))
+    SelfCheckGPT-NLI
+    P(contradict) = exp(zc) / (exp(ze) + exp(zc))
     """
     try:
         # 1. 샘플 생성
@@ -58,45 +82,58 @@ async def selfcheck_bertscore(question: str, answer: str) -> tuple[bool, float]:
             return False, 0.0
 
         # 2. 문장 분해
-        answer_sentences = split_sentences(answer)
-        if len(answer_sentences) == 0:
+        sentences = split_sentences(answer)
+        if len(sentences) == 0:
             return False, 0.0
 
-        # 3. Embedder
-        embedder = get_embedder()
-        if embedder is None:
+        # 3. NLI 모델
+        model, tokenizer = load_nli_model()
+        if model is None or tokenizer is None:
             return False, 0.0
 
-        # 4. 각 문장의 hallucination score
+        # 4. 각 문장의 모순 점수
         sentence_scores = []
 
-        for r_i in answer_sentences:
-            max_similarities = []
+        for sentence in sentences:
+            contradiction_probs = []
 
             for sample in samples:
-                sample_sentences = split_sentences(sample)
-                if len(sample_sentences) == 0:
-                    continue
-
                 try:
-                    r_i_emb = embedder.encode(r_i, convert_to_tensor=True, device=DEVICE)
-                    sample_embs = embedder.encode(sample_sentences, convert_to_tensor=True, device=DEVICE)
-
-                    similarities = torch.cosine_similarity(
-                        r_i_emb.unsqueeze(0),
-                        sample_embs
+                    # Tokenize
+                    inputs = tokenizer(
+                        sample[:200],      # premise
+                        sentence[:200],    # hypothesis
+                        return_tensors="pt",
+                        truncation=True,
+                        max_length=512,
+                        padding=True
                     )
 
-                    max_sim = similarities.max().item()
-                    max_similarities.append(max_sim)
+                    # RoBERTa는 token_type_ids 불필요 (제거)
+                    if "token_type_ids" in inputs:
+                        del inputs["token_type_ids"]
 
-                except Exception:
+                    inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
+
+                    # NLI 추론
+                    with torch.no_grad():
+                        outputs = model(**inputs)
+                        logits = outputs.logits[0]
+
+                    # P(contradict)
+                    ze = logits[0]  # entailment
+                    zc = logits[2]  # contradiction
+
+                    p_contradict = torch.exp(zc) / (torch.exp(ze) + torch.exp(zc))
+                    contradiction_probs.append(p_contradict.item())
+
+                except Exception as e:
+                    # 조용히 넘어감 (일부 실패 허용)
                     continue
 
-            if max_similarities:
-                avg_max_sim = np.mean(max_similarities)
-                s_bert_i = 1 - avg_max_sim
-                sentence_scores.append(s_bert_i)
+            if contradiction_probs:
+                avg_contradict = np.mean(contradiction_probs)
+                sentence_scores.append(avg_contradict)
 
         if not sentence_scores:
             return False, 0.0
@@ -105,57 +142,38 @@ async def selfcheck_bertscore(question: str, answer: str) -> tuple[bool, float]:
         final_score = np.mean(sentence_scores)
 
         # 6. Threshold
-        is_hallucinated = final_score > BERTSCORE_THRESHOLD
+        is_hallucinated = final_score > THRESHOLD
 
         return is_hallucinated, final_score
 
     except Exception as e:
-        print(f"[ERROR] BERTScore 실패: {e}")
+        print(f"[ERROR] SelfCheck-NLI 실패: {e}")
         return False, 0.0
 
 
-async def evaluate_ours(cases):
-    """우리 모델: BERTScore + NER + NLI"""
+async def evaluate_selfcheck_nli(cases):
+    """SelfCheckGPT-NLI 평가"""
     print("\n" + "="*70)
-    print("우리 모델 평가 (BERTScore + NER + NLI)")
-    print(f"BERTScore Threshold: {BERTSCORE_THRESHOLD}")
+    print("SelfCheckGPT-NLI 평가")
+    print(f"Threshold: {THRESHOLD}")
     print(f"Samples: {N_SAMPLES}")
     print(f"Device: {DEVICE}")
     print("="*70)
-
-    # 초기화
-    ner_checker = NERFactChecker()
-    await retriever.warmup()
 
     results = []
 
     for case in tqdm(cases, desc="평가 중"):
         try:
-            # 1. BERTScore (일관성)
-            is_inconsistent, consistency_score = await selfcheck_bertscore(
+            is_hallu_detected, score = await selfcheck_nli_score(
                 case.question,
                 case.answer
-            )
-
-            # 2. RAG 검색
-            rag_docs = await retriever.retrieve_async(case.question, top_k=5)
-
-            # 3. NER + NLI
-            ner_result = await ner_checker.check(case.answer, rag_docs)
-
-            # 4. OR 조건
-            is_hallu_detected = (
-                is_inconsistent or
-                len(ner_result.mismatched_entities) > 0
             )
 
             results.append({
                 "hallu_id": case.hallu_id,
                 "true_label": bool(case.is_hallucinated),
                 "predicted": bool(is_hallu_detected),
-                "consistency_score": float(consistency_score),
-                "is_inconsistent": bool(is_inconsistent),
-                "ner_hallucinations": int(len(ner_result.mismatched_entities)),
+                "contradiction_score": float(score),
                 "hallu_type": case.hallu_type
             })
 
@@ -168,9 +186,7 @@ async def evaluate_ours(cases):
                 "hallu_id": case.hallu_id,
                 "true_label": bool(case.is_hallucinated),
                 "predicted": False,
-                "consistency_score": 0.0,
-                "is_inconsistent": False,
-                "ner_hallucinations": 0,
+                "contradiction_score": 0.0,
                 "hallu_type": case.hallu_type
             })
 
@@ -190,7 +206,7 @@ async def evaluate_ours(cases):
     output_dir = Path("scripts_hallucination/results")
     output_dir.mkdir(exist_ok=True)
 
-    output_path = output_dir / "ours_results.json"
+    output_path = output_dir / "selfcheck_nli_results.json"
     with output_path.open("w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
 
@@ -212,17 +228,18 @@ async def evaluate_ours(cases):
     print(f"F1-Score: {f1:.4f}")
     print(f"\nTP: {tp}, FP: {fp}, FN: {fn}, TN: {tn}")
 
-    # 단계별 기여도
-    consistency_detected = sum(1 for r in results if r["true_label"] and r["is_inconsistent"])
-    ner_detected = sum(1 for r in results if r["true_label"] and r["ner_hallucinations"] > 0)
+    # 점수 분포
+    hallu_scores = [r["contradiction_score"] for r in results if r["true_label"]]
+    normal_scores = [r["contradiction_score"] for r in results if not r["true_label"]]
 
-    print(f"\n=== 단계별 기여도 ===")
-    print(f"BERTScore로 탐지: {consistency_detected}/{tp} ({consistency_detected/tp*100 if tp > 0 else 0:.1f}%)")
-    print(f"NER/NLI로 탐지: {ner_detected}/{tp} ({ner_detected/tp*100 if tp > 0 else 0:.1f}%)")
+    if hallu_scores and normal_scores:
+        print(f"\n=== 점수 분포 ===")
+        print(f"환각 평균: {np.mean(hallu_scores):.4f}")
+        print(f"정상 평균: {np.mean(normal_scores):.4f}")
 
     return results
 
 
 if __name__ == "__main__":
     cases = load_dataset()
-    asyncio.run(evaluate_ours(cases))
+    asyncio.run(evaluate_selfcheck_nli(cases))

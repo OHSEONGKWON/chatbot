@@ -6,10 +6,11 @@ import re
 from pathlib import Path
 from tqdm import tqdm
 
-sys.path.append(str(Path(__file__).resolve().parents[1]))
+sys.path.append(str(Path(__file__).resolve().parents[2]))
 
 from src.modules.llm_client import llm_client
-from load_dataset import load_dataset
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+from alcv.dataset import load_dataset
 
 
 async def extract_facts(answer: str) -> list[str]:
