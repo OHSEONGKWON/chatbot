@@ -1,9 +1,0 @@
-{
-  "BM25-RAG": {
-    "faithfulness": 0.9595959595959596,
-    "answer_relevancy": 0.9181818181818182,
-    "context_precision": 0.38257575757575757,
-    "context_recall": 0.38257575757575757,
-    "citation_accuracy": 0.5151515151515151
-  }
-}
