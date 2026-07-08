@@ -10,8 +10,9 @@ load_dotenv()
 
 client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
-# 누적 사용량 (비용 리포트용)
-usage = {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0, "failures": 0}
+# 누적 사용량 (비용 리포트용) + 재현성용 실제 모델 스냅샷 버전
+usage = {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0, "failures": 0,
+         "model_versions": set()}
 
 # gpt-4o-mini 단가 ($/1M tokens)
 PRICE_IN, PRICE_OUT = 0.15, 0.60
@@ -34,6 +35,7 @@ async def chat_json(system: str, user: str, *, model: str = "gpt-4o-mini",
                 usage["prompt_tokens"] += resp.usage.prompt_tokens
                 usage["completion_tokens"] += resp.usage.completion_tokens
                 usage["calls"] += 1
+                usage["model_versions"].add(resp.model)
                 return json.loads(resp.choices[0].message.content)
             except (RateLimitError, APIConnectionError, APIError, json.JSONDecodeError) as e:
                 if attempt == max_retries - 1:
@@ -59,6 +61,7 @@ async def chat_text(system: str, user: str, *, model: str = "gpt-4o-mini",
                 usage["prompt_tokens"] += resp.usage.prompt_tokens
                 usage["completion_tokens"] += resp.usage.completion_tokens
                 usage["calls"] += 1
+                usage["model_versions"].add(resp.model)
                 return resp.choices[0].message.content
             except (RateLimitError, APIConnectionError, APIError) as e:
                 if attempt == max_retries - 1:
@@ -70,6 +73,7 @@ async def chat_text(system: str, user: str, *, model: str = "gpt-4o-mini",
 
 def cost_report() -> str:
     cost = usage["prompt_tokens"] / 1e6 * PRICE_IN + usage["completion_tokens"] / 1e6 * PRICE_OUT
+    versions = ", ".join(sorted(usage["model_versions"])) or "-"
     return (f"호출 {usage['calls']}건(실패 {usage['failures']}), "
             f"토큰 in {usage['prompt_tokens']:,} / out {usage['completion_tokens']:,}, "
-            f"비용 약 ${cost:.3f}")
+            f"비용 약 ${cost:.3f} | 모델 버전: {versions}")
